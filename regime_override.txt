@@ -1,0 +1,2 @@
+# Optional manual override for the system regime.
+# Leave this blank to let the model decide. To force it, put GREEN, YELLOW or RED on its own line below.

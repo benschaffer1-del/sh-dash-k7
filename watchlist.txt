@@ -1,0 +1,19 @@
+# Your watchlist. One ticker per line (Yahoo Finance symbols).
+# Lines starting with # are ignored. Save (commit) and the dashboard updates in a few minutes.
+# Examples: SPY, QQQ, NVDA, GLD, BTC-USD
+SPY
+QQQ
+RSP
+SCHD
+FENY
+FUTY
+FMAT
+PAVE
+MLPX
+FHLC
+GDX
+GLD
+SLV
+NVDA
+MSFT
+NTRA
