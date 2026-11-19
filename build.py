@@ -308,6 +308,30 @@ def build():
     verdict = ("Pivot confirmed: deploy dry powder in tranches", "green") if npiv >= 4 else \
               ("Pivot forming: consider a first tranche", "yellow") if npiv >= 2 else ("No pivot yet: keep dry powder", "grey")
 
+    # blood in the streets (capitulation) panel
+    vix, stl = S["VIXCLS"], S["STLFSI4"]
+    def peak_then(s, days=120):
+        d, v = last(s)
+        if d is None: return None, None
+        return max_since(s, d - dt.timedelta(days=days)), v
+    caps = []
+    pk, v = peak_then(vix)
+    caps.append(("VIX spiked, then calmed", f"120-day peak {fmt(pk, '')}, now {fmt(v, '')}" if num(v) else "n/a",
+                 num(pk) and num(v) and pk >= 40 and v < 30, "Peak above 40, now below 30"))
+    pk, v = peak_then(hy)
+    caps.append(("Junk spreads blew out, now easing", f"120-day peak {fmt(pk, '%')}, now {fmt(v, '%')}" if num(v) else "n/a",
+                 num(pk) and num(v) and pk >= 7 and v <= pk - 1, "Peak above 7%, now 1+ pt lower"))
+    pk, v = peak_then(stl)
+    caps.append(("Stress index peaked and falling", f"120-day peak {fmt(pk, '')}, now {fmt(v, '')}" if num(v) else "n/a",
+                 num(pk) and num(v) and pk >= 2 and v <= pk - 0.5, "Peak above 2, now 0.5+ lower"))
+    caps.append(("Rescue under way", f"{npiv} of 5 pivot signals lit", npiv >= 2, "2+ pivot signals"))
+    spy = prices("SPY")
+    off = (spy["price"] / spy["high52"] - 1) if spy else None
+    caps.append(("Stocks deeply marked down", f"SPY {pct(off)} from 52-wk high" if num(off) else "n/a",
+                 num(off) and off <= -0.25, "SPY 25%+ below its high"))
+    ncap = sum(1 for c in caps if c[2])
+    capitulation = ncap >= 3
+
     # prices
     hard = []
     P = {}
@@ -338,10 +362,12 @@ def build():
             watch.append(dict(t=t, ok=False)); continue
         m = setup_trend(p)
         lab, tone, size = signal(regime, m["setup"], m["trend"])
+        if capitulation and m["setup"] != "Overbought":
+            lab, tone, size = "Capitulation: buy in tranches", "green", "1/3 of planned"
         watch.append(dict(t=t, ok=True, price=p["price"], sig=lab, tone=tone, size=size, **m))
 
     os.makedirs(OUT, exist_ok=True)
-    render(dict(regime=regime, calc=calc, override=override, score=score, rows=rows, pivots=pivots, npiv=npiv,
+    render(dict(caps=caps, ncap=ncap, capitulation=capitulation, regime=regime, calc=calc, override=override, score=score, rows=rows, pivots=pivots, npiv=npiv,
                 verdict=verdict, hard=hard, ratios=ratios, watch=watch, nodata=nodata))
     write_icon(os.path.join(OUT, "icon.png"))
     json.dump({"updated": NOW.isoformat(), "regime": regime, "score": score,
@@ -376,6 +402,7 @@ def render(d):
     reg = d["regime"]; tone = TONE[reg]
     deploy = {"GREEN": "Up to full planned size", "YELLOW": "1/3 size, in tranches",
               "RED": "None. Hold cash, trim strength.", "NO DATA": "Waiting on data"}[reg]
+    if d["capitulation"]: deploy = "1/3 size tranches (capitulation)"
     line = {"GREEN": "Conditions healthy. Buy dips in uptrends.",
             "YELLOW": "Stress building. Small, staged buys only.",
             "RED": "Stress high. Protect capital and keep dry powder.",
@@ -404,6 +431,14 @@ def render(d):
     ratios = "".join(f'<div class="ratio"><b>{E(n)}</b> <span>{v:.1f}</span> <small class="muted">{E(note)}</small></div>' if num(v)
                      else f'<div class="ratio"><b>{E(n)}</b> <span>n/a</span></div>' for n, v, note in d["ratios"])
 
+    cap = "".join(f'''<li class="{ 'hit' if hit else ''}"><span class="dot"></span><div><b>{E(n)}</b><small>{E(reading)}. Trigger: {E(trig)}</small></div><span class="yn">{'YES' if hit else 'no'}</span></li>'''
+                  for n, reading, hit, trig in d["caps"])
+    if d["capitulation"]:
+        capv = ("Capitulation signal ON: start buying in tranches, 1/3 of planned size at a time, even though the regime may read red.", "green")
+    elif d["ncap"] == 2:
+        capv = ("Getting close: 2 of 5 lit. Line up your buy list and cash.", "yellow")
+    else:
+        capv = ("Not yet. No sign of a washout. Patience.", "grey")
     piv = "".join(f'''<li class="{ 'hit' if hit else ''}"><span class="dot"></span><div><b>{E(n)}</b><small>{E(reading)}. Trigger: {E(trig)}</small></div><span class="yn">{'YES' if hit else 'no'}</span></li>'''
                   for n, reading, hit, trig in d["pivots"])
 
@@ -428,7 +463,8 @@ def render(d):
     page = TEMPLATE.format(
         tone=tone, regime=reg, score=score, red=counts["RED"], yel=counts["YELLOW"], grn=counts["GREEN"],
         nodsuffix=(f" ({d['nodata']} missing)" if d["nodata"] else ""), deploy=E(deploy), line=E(line), ov=ov, watch="".join(wl) or '<p class="muted">Your watchlist is empty.</p>',
-        hard=hard, ratios=ratios, piv=piv, pivn=d["npiv"], verdict=E(d["verdict"][0]), vtone=d["verdict"][1],
+        hard=hard, ratios=ratios, piv=piv, pivn=d["npiv"], cap=cap, ncap=d["ncap"], capv=E(capv[0]), captone=capv[1],
+        capbanner=('<p class="capb">Capitulation signal is ON. See the panel below.</p>' if d["capitulation"] else ""), verdict=E(d["verdict"][0]), vtone=d["verdict"][1],
         metrics="".join(mets), upd=upd,
         edit=(f'<a href="{edit}">Edit watchlist</a>' if edit else "Edit watchlist.txt in your GitHub repo"),
         override_link=(f'<a href="https://github.com/{REPO}/edit/main/regime_override.txt">Set a manual regime override</a>' if REPO else ""))
@@ -472,6 +508,7 @@ h1,h2,h3{{font-family:'Inter Tight',Inter,sans-serif;margin:0}}
 .gauge{{display:flex;gap:10px;flex-wrap:wrap}}
 .gauge div{{background:rgba(255,255,255,.14);border-radius:10px;padding:8px 12px;flex:1 1 140px}}
 .gauge b{{display:block;font-size:20px;font-family:'Inter Tight',sans-serif}}.gauge small{{font-size:12px;opacity:.85}}
+.capb{{background:#fff;color:#0f6b3a;font-weight:700;border-radius:8px;padding:8px 12px;margin:12px 0 0}}
 .ovr{{font-size:13px;margin:10px 0 0;opacity:.9}}
 section{{padding:22px 0 6px;border-bottom:1px solid var(--line)}}
 h2{{font-size:22px;margin-bottom:4px}}
@@ -523,14 +560,16 @@ footer a,.lede a{{color:inherit}}
 <h1>{regime}</h1><p class="sub">{line}</p>
 <div class="gauge"><div><b>{score}</b><small>Stress score</small></div><div><b>{deploy}</b><small>New money to deploy</small></div>
 <div><b>{red} / {yel} / {grn}</b><small>Red / yellow / green gauges{nodsuffix}</small></div></div>{ov}
-<div class="stale" id="stale">Data is more than 3 hours old. The hourly update may have paused.</div>
+{capbanner}<div class="stale" id="stale">Data is more than 3 hours old. The hourly update may have paused.</div>
 </div></header>
 <main class="wrap">
-<section id="watchlist"><h2>Watchlist</h2><p class="lede">Each ticker's setup, filtered through the regime above. Nothing turns green when the system is red. Tap a row for details. {edit}</p>{watch}</section>
-<section id="hard"><h2>Hard assets and crypto</h2><p class="lede">Gold and silver are front-month futures, close to spot.</p><div class="hgrid">{hard}</div>{ratios}</section>
+<section id="capitulation"><h2>Blood in the streets</h2><p class="lede">Washout signals that have marked past bottoms: {ncap} of 5 lit. Three or more turns the signal on and overrides the regime for buying.</p>
+<div class="verdict t-{captone}">{capv}</div><ul class="piv">{cap}</ul></section>
 <section id="pivot"><h2>Pivot watch</h2><p class="lede">Signs the Fed and Treasury rescue has started: {pivn} of 5 lit.</p>
 <div class="verdict t-{vtone}">{verdict}</div><ul class="piv">{piv}</ul></section>
+<section id="hard"><h2>Hard assets and crypto</h2><p class="lede">Gold and silver are front-month futures, close to spot.</p><div class="hgrid">{hard}</div>{ratios}</section>
 <section id="gauges"><h2>System gauges</h2><p class="lede">Tap any gauge for what it means and its thresholds. Bars show the last year.</p>{metrics}</section>
+<section id="watchlist"><h2>Watchlist</h2><p class="lede">Each ticker's setup, filtered through the regime. Nothing turns green when the system is red, unless the blood-in-the-streets signal is on. Tap a row for details. {edit}</p>{watch}</section>
 </main>
 <footer class="wrap"><p>Data: FRED (Federal Reserve Bank of St. Louis), Yahoo Finance, Stooq. Refreshes hourly. Thresholds are rules of thumb, not official cutoffs. Not financial advice.</p><p>{override_link}</p></footer>
 <script>
