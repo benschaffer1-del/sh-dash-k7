@@ -32,6 +32,7 @@ jobs:
         run: python build.py
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
