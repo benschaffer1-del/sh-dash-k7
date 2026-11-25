@@ -20,6 +20,7 @@ MONTH_AGO = TODAY - dt.timedelta(days=28)
 MOCK = os.environ.get("MOCK") == "1"
 FRED_KEY = os.environ.get("FRED_API_KEY", "").strip()
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()   # set as a GitHub secret to turn on phone alerts
 UA = {"User-Agent": "Mozilla/5.0 (personal dashboard; contact via GitHub)"}
 R, Y, G, N = "RED", "YELLOW", "GREEN", "NODATA"
 
@@ -97,6 +98,40 @@ def prices(sym):
     except Exception as e:
         print(f"Stooq {sym} failed: {e}")
         return None
+
+
+def ebp():
+    """Gilchrist-Zakrajsek excess bond premium from the Fed (monthly CSV). Returns (ebp_series, recession_prob_series)."""
+    if MOCK:
+        random.seed("ebp"); e, pr = [], []
+        for i in range(60):
+            d = TODAY - days(30 * (59 - i)); v = 0.05 + 0.25 * math.sin(i / 7) + random.gauss(0, 0.05)
+            e.append((d, v)); pr.append((d, 0.25 + v * 0.3))
+        return e, pr
+    try:
+        text = http("https://www.federalreserve.gov/econres/notes/feds-notes/ebp_csv.csv")
+        rows = list(csv.reader(io.StringIO(text.lstrip("\ufeff"))))
+        head = [h.strip().lower() for h in rows[0]]
+        di = next(i for i, h in enumerate(head) if "date" in h)
+        ei = next(i for i, h in enumerate(head) if h == "ebp" or ("ebp" in h and "prob" not in h))
+        pi = next((i for i, h in enumerate(head) if "prob" in h), None)
+        e, pr = [], []
+        for r in rows[1:]:
+            if len(r) <= ei: continue
+            raw = r[di].strip(); d = None
+            for f in ("%Y-%m-%d", "%m/%d/%Y", "%Y-%m", "%b %Y", "%Y%m"):
+                try: d = dt.datetime.strptime(raw, f).date(); break
+                except ValueError: pass
+            if not d: continue
+            try: e.append((d, float(r[ei])))
+            except ValueError: continue
+            if pi is not None:
+                try: pr.append((d, float(r[pi])))
+                except ValueError: pass
+        return e, pr
+    except Exception as ex:
+        print(f"EBP failed: {ex}")
+        return [], []
 
 
 def prices_long(sym):
@@ -214,6 +249,131 @@ WHITE_COLLAR = [("IHLIDXUSTPSOFTDEVE", "Software development"), ("IHLIDXUSTPITOP
                 ("IHLIDXUSTPHUMARESO", "Human resources"), ("IHLIDXUSTPACCO", "Accounting"),
                 ("IHLIDXUSTPBAFI", "Banking & finance"), ("IHLIDXUSTPLEGA", "Legal")]
 
+# ---- prediction markets (Kalshi + Polymarket), free public data, no keys
+KALSHI_HOSTS = ["https://api.elections.kalshi.com/trade-api/v2", "https://external-api.kalshi.com/trade-api/v2"]
+# Polymarket watch list: (label, search words, words that must all appear in the question, words that win ties)
+POLY_WATCH = [("US recession", "US recession", ["recession"], ["2027"]),
+              ("Bitcoin to $40k (Howell's risk case)", "Bitcoin 40,000", ["bitcoin", "40"], ["dip", "below", "2026", "2027"]),
+              ("Strait of Hormuz", "Strait of Hormuz", ["hormuz"], ["normal", "reopen"])]
+MON3 = {m: i + 1 for i, m in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])}
+
+def _f(x):
+    try: return float(x)
+    except (TypeError, ValueError): return None
+
+def kalshi_prob(m):
+    for a, b in [("yes_bid_dollars", "yes_ask_dollars"), ("yes_bid", "yes_ask")]:
+        lo, hi = _f(m.get(a)), _f(m.get(b))
+        if num(lo, hi) and hi > 0:
+            p = (lo + hi) / 2
+            return p / 100 if p > 1.0001 else p
+    for k in ("last_price_dollars", "last_price"):
+        v = _f(m.get(k))
+        if num(v): return v / 100 if v > 1.0001 else v
+    return None
+
+def fed_bucket(label):
+    t = label.lower().replace(" ", "")
+    if "maintain" in t or "hold" in t or "nochange" in t or "unchanged" in t: return "hold"
+    big = ">25" in t or "50" in t or "morethan25" in t
+    if "hike" in t or "raise" in t or "increase" in t: return "hike_big" if big else "hike25"
+    if "cut" in t or "lower" in t or "decrease" in t: return "cut_big" if big else "cut25"
+    return None
+
+def kalshi_fed():
+    """Next three FOMC meetings: list of dict(date, label, odds{bucket: p}, volume)."""
+    if MOCK:
+        base = [dict(hike_big=0.08, hike25=0.89, hold=0.03, cut25=0.0, cut_big=0.0),
+                dict(hike_big=0.03, hike25=0.31, hold=0.62, cut25=0.04, cut_big=0.0),
+                dict(hike_big=0.01, hike25=0.15, hold=0.66, cut25=0.17, cut_big=0.01)]
+        ds = [dt.date(2026, 12, 9), dt.date(2027, 1, 27), dt.date(2027, 3, 17)]
+        return [dict(date=d, label=d.strftime("%b %-d"), odds=o, ticker="mock") for d, o in zip(ds, base)]
+    for host in KALSHI_HOSTS:
+        try:
+            j = json.loads(http(f"{host}/markets?series_ticker=KXFEDDECISION&status=open&limit=200", tries=2))
+            ev, closes = {}, {}
+            for m in j.get("markets", []):
+                et = m.get("event_ticker") or ""
+                lab = m.get("yes_sub_title") or m.get("subtitle") or m.get("title") or ""
+                b, p = fed_bucket(lab), kalshi_prob(m)
+                if not b or not num(p): continue
+                ev.setdefault(et, {}).setdefault(b, 0.0); ev[et][b] += p
+                ct = (m.get("close_time") or m.get("expected_expiration_time") or "")[:10]
+                if ct: closes[et] = min(closes.get(et, ct), ct)
+            out = []
+            for et, odds in ev.items():
+                mm = re.search(r"-(\d{2})([A-Z]{3})(\d{2})?$", et)
+                if not mm or mm.group(2) not in MON3: continue
+                d = dt.date(2000 + int(mm.group(1)), MON3[mm.group(2)], int(mm.group(3)) if mm.group(3) else 15)
+                try:
+                    cd = dt.date.fromisoformat(closes[et])
+                    if abs((cd - d).days) <= 31: d = cd
+                except Exception:
+                    pass
+                tot = sum(odds.values()) or 1
+                out.append(dict(date=d, label=d.strftime("%b %-d, %Y"), odds={k: v / tot for k, v in odds.items()}, ticker=et))
+            out.sort(key=lambda x: x["date"])
+            if out: return out[:3]
+        except Exception as e:
+            print(f"Kalshi {host} failed: {e}")
+    return []
+
+def poly_watch():
+    """Returns list of dict(label, question, p_yes, end, volume, url)."""
+    if MOCK:
+        return [dict(label="US recession", question="US recession by end of 2027?", p=0.24, end="2027-12-31", volume=850000, url=""),
+                dict(label="Bitcoin to $40k (Howell's risk case)", question="Will Bitcoin dip to $40,000 by December 31, 2026?", p=0.11, end="2026-12-31", volume=2.1e6, url=""),
+                dict(label="Strait of Hormuz", question="Strait of Hormuz traffic returns to normal by December 31?", p=0.20, end="2026-12-31", volume=1.5e6, url="")]
+    out = []
+    for label, q, must, prefer in POLY_WATCH:
+        try:
+            j = json.loads(http("https://gamma-api.polymarket.com/public-search?" + urllib.parse.urlencode({"q": q, "limit_per_type": 20}), tries=2))
+            cands = []
+            for ev in j.get("events", []) or []:
+                for m in ev.get("markets", []) or []:
+                    qq = (m.get("question") or "").lower()
+                    if m.get("closed") or not all(w in qq for w in must): continue
+                    try:
+                        outs = json.loads(m.get("outcomes") or "[]"); prs = [float(x) for x in json.loads(m.get("outcomePrices") or "[]")]
+                    except Exception:
+                        continue
+                    if "Yes" not in outs or len(prs) != len(outs): continue
+                    endd = (m.get("endDate") or ev.get("endDate") or "")[:10]
+                    if endd and endd < str(TODAY): continue
+                    vol = _f(m.get("volume")) or _f(m.get("volumeNum")) or 0
+                    score = sum(1 for w in prefer if w in qq) * 1e9 + vol
+                    cands.append((score, dict(label=label, question=m.get("question"), p=prs[outs.index("Yes")], end=endd, volume=vol,
+                                              url=f"https://polymarket.com/event/{ev.get('slug')}" if ev.get("slug") else "")))
+            if cands:
+                out.append(max(cands, key=lambda c: c[0])[1])
+        except Exception as e:
+            print(f"Polymarket '{q}' failed: {e}")
+    return out
+
+# ---- history: one snapshot every few hours, carried forward through the published site
+def load_history():
+    if MOCK:
+        return []
+    if REPO and "/" in REPO:
+        owner, repo = REPO.split("/", 1)
+        try:
+            h = json.loads(http(f"https://{owner.lower()}.github.io/{repo}/history.json", tries=2))
+            if isinstance(h, list): return h
+        except Exception as e:
+            print(f"No previous history ({e}); starting fresh")
+    return []
+
+def save_history(hist, snap):
+    hist = [h for h in hist if isinstance(h, dict) and "t" in h]
+    if hist:
+        last_t = dt.datetime.fromisoformat(hist[-1]["t"])
+        if (NOW - last_t).total_seconds() < 3 * 3600: hist[-1] = snap
+        else: hist.append(snap)
+    else:
+        hist.append(snap)
+    cutoff = NOW - dt.timedelta(days=120)
+    return [h for h in hist if dt.datetime.fromisoformat(h["t"]) >= cutoff]
+
 # =========================================================================== sample data (testing only)
 
 MOCK_BASE = {
@@ -231,17 +391,23 @@ MOCK_BASE = {
     "IHLIDXUS": 106.0, "IHLIDXUSTPSOFTDEVE": 81.7, "TDSP": 11.3, "BCNSDODNS": 2.1e7, "CMDEBT": 1.9e4,
     "CSUSHPINSA": 330.0, "GDP": 31000.0, "IHLIDXUSTPITOPHE": 70.0, "IHLIDXUSTPMECO": 67.2, "IHLIDXUSTPMARK": 78.0,
     "IHLIDXUSTPCUSTSERV": 87.5, "IHLIDXUSTPADMIASSI": 92.2, "IHLIDXUSTPHUMARESO": 99.3, "IHLIDXUSTPACCO": 107.5,
-    "IHLIDXUSTPBAFI": 107.2, "IHLIDXUSTPLEGA": 125.3}
+    "IHLIDXUSTPBAFI": 107.2, "IHLIDXUSTPLEGA": 125.3, "WTREGEN": 850000.0, "RRPONTSYD": 8.0, "WRESBAL": 3050.0,
+    "ECBASSETSW": 6.2e6, "DEXUSEU": 1.15, "JPNASSETS": 7.4e6, "THREEFYTP10": 0.95, "USALOLITOAASTSAM": 100.96,
+    "NOCDFSA066MSFRBPHI": -0.4, "NOCDINA066MNFRBNY": 9.9, "PERMIT": 1295.0, "SUBLPDRCSN": 8.8, "STDSAUTO": -2.1,
+    "NFCIRISK": -0.53, "NCBEILQ027S": 8.3e7}
 MOCK_STEP = {"WALCL": 7, "ICSA": 7, "CCSA": 7, "NFCI": 7, "STLFSI4": 7, "DRCCLACBS": 91, "DRTSCILM": 91,
              "A091RC1Q027SBEA": 91, "FGRECPT": 91, "GFDEGDQ188S": 91, "FYFSGDA188S": 365,
              "WFRBST01134": 91, "WFRBSB50215": 91, "DRCRELEXFACBS": 91, "DRTSCLCC": 91, "NFCICREDIT": 7,
-             "NFCILEVERAGE": 7, "IC4WSA": 7, "TDSP": 91, "BCNSDODNS": 91, "CMDEBT": 91, "GDP": 91}
+             "NFCILEVERAGE": 7, "IC4WSA": 7, "TDSP": 91, "BCNSDODNS": 91, "CMDEBT": 91, "GDP": 91,
+             "WTREGEN": 7, "WRESBAL": 7, "ECBASSETSW": 7, "THREEFYTP10": 7, "SUBLPDRCSN": 91, "STDSAUTO": 91,
+             "NFCIRISK": 7, "NCBEILQ027S": 91}
 MOCK_MONTHLY = {"U6RATE", "PSAVERT", "SAHMREALTIME", "CPIAUCSL", "IRLTLT01JPM156N", "LNS14000036",
                 "CES6054150001", "USINFO", "TEMPHELPS", "JTSQUR", "CUSR0000SAF11", "CUSR0000SAH1",
-                "CUSR0000SEHF01", "CUSR0000SETE", "UMCSENT", "JTSLDR", "CSUSHPINSA"}
+                "CUSR0000SEHF01", "CUSR0000SETE", "UMCSENT", "JTSLDR", "CSUSHPINSA", "JPNASSETS",
+                "USALOLITOAASTSAM", "NOCDFSA066MSFRBPHI", "NOCDINA066MNFRBNY", "PERMIT"}
 MOCK_TREND = {"CPIAUCSL": 0.0025, "CUSR0000SAF11": 0.0025, "CUSR0000SAH1": 0.003, "CUSR0000SEHF01": 0.004,
               "CUSR0000SETE": 0.005, "CES6054150001": -0.002, "USINFO": -0.001, "TEMPHELPS": -0.004,
-              "BCNSDODNS": 0.012, "CMDEBT": 0.013, "CSUSHPINSA": 0.004, "GDP": 0.012}
+              "BCNSDODNS": 0.012, "CMDEBT": 0.013, "CSUSHPINSA": 0.004, "GDP": 0.012, "NCBEILQ027S": 0.02}
 
 def mock_fred(sid, days):
     random.seed(sid)
@@ -263,7 +429,7 @@ def mock_fred(sid, days):
 
 def mock_prices(sym):
     random.seed(sym)
-    p = {"GC=F": 3850, "SI=F": 47, "BTC-USD": 64500, "JPY=X": 152.0}.get(sym, random.uniform(30, 700))
+    p = {"GC=F": 3850, "SI=F": 47, "BTC-USD": 64500, "JPY=X": 152.0, "^MOVE": 104.0}.get(sym, random.uniform(30, 700))
     closes, x = [], 1.0
     drift = random.uniform(-0.0012, 0.0012)
     for _ in range(252):
@@ -375,10 +541,14 @@ GAUGES = [
     ("Credit", "Investment-grade spread", "BAMLC0A0CM", g_level("BAMLC0A0CM"), "%", "up", 1.3, 1.8, "Stress in blue-chip corporate debt."),
     ("Credit", "CCC junk spread", "BAMLH0A3HYC", g_level("BAMLH0A3HYC"), "%", "up", 9, 12, "Weakest borrowers. Cracks show here first."),
     ("Credit", "CCC vs high-yield ratio", "X:CCCHY", g_level("X:CCCHY"), "x", "up", 3.0, 3.5, "How much worse the weakest borrowers are doing than junk overall. Rising = stress concentrating at the bottom."),
+    ("Credit", "Excess bond premium", "X:EBP", g_level("X:EBP"), "pts", "up", 0.25, 0.75, "Credit spreads beyond expected defaults: pure investor fear. Gilchrist and Zakrajsek found it among the best recession predictors (Fed data, monthly)."),
     ("Credit", "Banks tightening business loans", "DRTSCILM", g_level("DRTSCILM"), "net %", "up", 10, 25, "Fed loan officer survey. Credit crunch gauge."),
     ("Credit", "Banks tightening credit cards", "DRTSCLCC", g_level("DRTSCLCC"), "net %", "up", 10, 25, "Fed loan officer survey, consumer side."),
+    ("Credit", "Banks tightening CRE loans", "SUBLPDRCSN", g_level("SUBLPDRCSN"), "net %", "up", 10, 25, "Fed loan officer survey: office, retail and other commercial property loans."),
+    ("Credit", "Banks tightening auto loans", "STDSAUTO", g_level("STDSAUTO"), "net %", "up", 10, 25, "Fed loan officer survey: car loans."),
     ("Conditions", "Chicago Fed financial conditions", "NFCI", g_level("NFCI"), "", "up", -0.3, 0.0, "Above 0 = tighter than average."),
     ("Conditions", "St. Louis Fed stress index", "STLFSI4", g_level("STLFSI4"), "", "up", 0.0, 1.0, "Above 0 = above-normal stress."),
+    ("Conditions", "NFCI risk component", "NFCIRISK", g_level("NFCIRISK"), "", "up", -0.2, 0.0, "Risk part of the Chicago Fed index: volatility and funding risk. Above 0 = tighter than average."),
     ("Conditions", "NFCI credit component", "NFCICREDIT", g_level("NFCICREDIT"), "", "up", -0.2, 0.0, "Credit part of the Chicago Fed index. Above 0 = tighter than average."),
     ("Conditions", "NFCI leverage component", "NFCILEVERAGE", g_level("NFCILEVERAGE"), "", "up", -0.1, 0.25, "Leverage part of the Chicago Fed index. Rising = leverage building."),
     ("Conditions", "VIX", "VIXCLS", g_level("VIXCLS"), "", "up", 20, 27, "Fear gauge for stocks."),
@@ -386,6 +556,10 @@ GAUGES = [
     ("Conditions", "Market breadth, 3-mo", "X:BREADTH", g_change("X:BREADTH", 90), "pct", "down", -0.03, -0.06, "Equal-weight vs cap-weight S&P (RSP vs SPY). Falling = fewer stocks carrying the index."),
     ("Dollar & oil", "Broad dollar, 3-mo change", "DTWEXBGS", g_change("DTWEXBGS", 90), "pct", "up", 0.02, 0.04, "A fast-rising dollar squeezes global dollar borrowers."),
     ("Dollar & oil", "Brent crude", "DCOILBRENTEU", g_level("DCOILBRENTEU"), "$", "up", 85, 100, "War and supply strain. Feeds inflation."),
+    ("Growth", "OECD leading indicator", "USALOLITOAASTSAM", g_level("USALOLITOAASTSAM"), "", "down", 100.0, 99.0, "Free stand-in for the Conference Board LEI. 100 = trend growth; below and falling warns of recession."),
+    ("Growth", "Philly Fed new orders", "NOCDFSA066MSFRBPHI", g_level("NOCDFSA066MSFRBPHI"), "", "down", 0, -10, "Factory new orders in the Philadelphia district. Below 0 = shrinking. A free ISM proxy."),
+    ("Growth", "NY Fed new orders", "NOCDINA066MNFRBNY", g_level("NOCDINA066MNFRBNY"), "", "down", 0, -10, "Factory new orders in New York State. Below 0 = shrinking."),
+    ("Growth", "Building permits, 1 yr", "PERMIT", g_change("PERMIT", 365), "pct", "down", -0.05, -0.15, "Housing permits vs a year ago. Housing usually turns before the economy does."),
     ("Labor", "Sahm rule", "SAHMREALTIME", g_level("SAHMREALTIME"), "", "up", 0.3, 0.5, "0.5 or higher has historically meant recession."),
     ("Labor", "Initial jobless claims", "ICSA", g_level("ICSA", 0.001), "k", "up", 250, 300, "Weekly layoffs."),
     ("Labor", "Continuing claims", "CCSA", g_level("CCSA", 1e-6), "M", "up", 1.95, 2.1, "How hard it is to land the next job."),
@@ -638,6 +812,18 @@ def quarterly(series):
 
 def buildup(S, spx):
     rows, add = _rows()
+    h = at(S["BAMLH0A0HYM2"], TODAY)
+    if num(h):
+        st = R if h <= 2.6 else Y if h <= 3.0 else G
+        add("Credit complacency", f"junk {h:.2f}%", st, "can snap wider fast", "note", tail(S, "BAMLH0A0HYM2", 1095), last(S["BAMLH0A0HYM2"])[0],
+            "Very tight junk spreads mean investors are paid little for risk, which leaves room for a sudden repricing. The 2007 low was about 2.4%.",
+            "Yellow at 3.0% or tighter, red at 2.6% or tighter")
+    mc = quarterly(join(S["NCBEILQ027S"], S["GDP"], lambda a, b: a / 1000 / b * 100))
+    if len(mc) > 40:
+        pc = pctile([v for _, v in mc], mc[-1][1])
+        add("Stock market value vs GDP", f"{mc[-1][1]:.0f}% of GDP", R if pc >= 95 else Y if pc >= 80 else G, f"{ordinal(pc)} pctile of history", "note",
+            [v for _, v in mc][-40:], mc[-1][0], "US corporate equity value relative to the economy (the 'Buffett indicator'). High readings magnify the damage when credit turns.",
+            "Yellow at the 80th percentile of history, red at the 95th")
     v, v1 = at(S["TDSP"], TODAY), at(S["TDSP"], TODAY - days(365))
     if num(v, v1):
         add("Household debt service", f"{v:.1f}% of income", level(v, "up", 10.5, 12.0), f"{v - v1:+.1f} pts in 1 yr", v > v1,
@@ -660,6 +846,138 @@ def buildup(S, spx):
             f"Greenwood and Shleifer found crisis odds jump from about 7% to 40% when both run hot. Line shows credit growth.",
             "Red: credit in the top 20% of history AND assets in the top third. Yellow: credit hot alone")
     return rows
+
+# =========================================================================== recession watch (clusters, not single signals)
+
+def recession_watch(S, t):
+    out = []
+    a, b, c = at(S["T10Y3M"], t), at(S["T10Y2Y"], t), at(S["T10Y2Y"], t - days(91))
+    two, two3 = at(S["DGS2"], t), at(S["DGS2"], t - days(91))
+    resteep = num(b, c, two, two3) and (b - c >= 0.5 and two - two3 <= -0.5)
+    inv = (num(a) and a < 0) or (num(b) and b < 0)
+    out.append(("Yield curve", inv or resteep, ("inverted" if inv else "bull re-steepening" if resteep else "normal") + (f" (10y-3m {a:+.2f}, 2s10s {b:+.2f})" if num(a, b) else "")))
+    h, h3 = at(S["BAMLH0A0HYM2"], t), at(S["BAMLH0A0HYM2"], t - days(91)); e = at(S["X:EBP"], t)
+    lit = (num(h, h3) and h - h3 >= 1.0) or (num(e) and e >= 0.5)
+    out.append(("Credit stress building", lit, (f"junk spread {h - h3:+.2f} in 3 mo" if num(h, h3) else "junk n/a") + (f", bond premium {e:+.2f}" if num(e) else "")))
+    l, l6 = at(S["USALOLITOAASTSAM"], t), at(S["USALOLITOAASTSAM"], t - days(182))
+    out.append(("Leading index falling", num(l, l6) and l < 100 and l < l6 - 0.3, f"OECD index {l:.2f}, {l - l6:+.2f} in 6 mo" if num(l, l6) else "n/a"))
+    p_, n_ = at(S["NOCDFSA066MSFRBPHI"], t), at(S["NOCDINA066MNFRBNY"], t)
+    vals = [v for v in (p_, n_) if num(v)]
+    avg = sum(vals) / len(vals) if vals else None
+    out.append(("Factory orders shrinking", num(avg) and avg < -5, f"Philly {p_:+.1f}, NY {n_:+.1f}" if num(p_, n_) else "n/a"))
+    pm, pm1 = at(S["PERMIT"], t), at(S["PERMIT"], t - days(365))
+    out.append(("Building permits down 15%+", num(pm, pm1) and pm / pm1 - 1 <= -0.15, f"{pct(pm / pm1 - 1)} in 1 yr" if num(pm, pm1) else "n/a"))
+    tight = [(nm, at(S[sid], t)) for sid, nm in [("DRTSCILM", "business"), ("SUBLPDRCSN", "CRE"), ("DRTSCLCC", "cards"), ("STDSAUTO", "autos")]]
+    hot = [nm for nm, v in tight if num(v) and v >= 20]
+    out.append(("Banks tightening broadly", len(hot) >= 2, f"{len(hot)} of 4 loan types at 20%+ net tightening" + (f" ({', '.join(hot)})" if hot else "")))
+    ic, ic3 = at(S["IC4WSA"], t), at(S["IC4WSA"], t - days(91))
+    out.append(("Jobless claims up 15%+", num(ic, ic3) and ic / ic3 - 1 >= 0.15, f"{pct(ic / ic3 - 1)} in 3 mo" if num(ic, ic3) else "n/a"))
+    sm = at(S["SAHMREALTIME"], t)
+    out.append(("Sahm rule triggered", num(sm) and sm >= 0.5, f"{sm:.2f}" if num(sm) else "n/a"))
+    return out
+
+# =========================================================================== liquidity (Howell-style proxy) and hard-asset bottoms
+# Michael Howell's Global Liquidity Index is proprietary. This is a free proxy built from central bank balance sheets:
+#   US net liquidity = Fed balance sheet - Treasury cash (TGA) - reverse repo
+#   + ECB balance sheet in dollars + Bank of Japan balance sheet in dollars.
+# Howell finds liquidity leads Bitcoin by about 13 weeks; we chart that lead.
+
+def liquidity(S):
+    out_us, out_g = [], []
+    for d, w in S["WALCL"]:
+        tga, rrp = at(S["WTREGEN"], d), at(S["RRPONTSYD"], d)
+        if not num(w, tga): continue
+        us = (w - tga) / 1e6 - (rrp / 1e3 if num(rrp) else 0)
+        out_us.append((d, us))
+        ecb, eur, boj, jpy = at(S["ECBASSETSW"], d), at(S["DEXUSEU"], d), at(S["JPNASSETS"], d), at(S["DEXJPUS"], d)
+        if num(ecb, eur, boj, jpy):
+            out_g.append((d, us + ecb * eur / 1e6 + boj * 1e8 / jpy / 1e12))
+    return out_us, out_g
+
+def momentum(series, t, n):
+    a, b = at(series, t), at(series, t - days(n))
+    return a / b - 1 if num(a, b) and b else None
+
+def liq_state(series, t):
+    m6, m13 = momentum(series, t, 42), momentum(series, t, 91)
+    m6p = momentum(series, t - days(42), 42)
+    if not num(m6, m13): return "No data", N, m6, m13
+    if m6 > 0 and m13 > 0: return "Rising", G, m6, m13
+    if m6 > 0 or (num(m6p) and m6 > m6p and m6 > -0.002): return "Turning up", Y, m6, m13
+    if m13 > 0: return "Rolling over", Y, m6, m13
+    return "Falling", R, m6, m13
+
+BOTTOM_CFG = {"BTC-USD": ("Bitcoin", 0.35), "GC=F": ("Gold", 0.12), "SI=F": ("Silver", 0.20)}
+
+def bottom_score(p, washout, liq_ok, usd_ok):
+    ser = p["series"]; price = p["price"]; closes = p["closes"]
+    win = [c for d, c in ser if d >= TODAY - days(120)]
+    peak, mdd = 0, 0
+    for c in win:
+        peak = max(peak, c); mdd = min(mdd, c / peak - 1)
+    low30 = min([c for d, c in ser if d >= TODAY - days(30)] or [price])
+    low180 = min([c for d, c in ser if d >= TODAY - days(180)] or [price])
+    a20 = sum(closes[-20:]) / 20; a20p = sum(closes[-25:-5]) / 20; a50 = sum(closes[-50:]) / 50
+    checks = [
+        ("Washout", mdd <= -washout, f"fell {pct(mdd, False)} from a peak in the last 4 months (needs {washout*100:.0f}%+)"),
+        ("Retest", low30 <= low180 * 1.10, "held at or above its 6-month low on a pullback in the last 30 days (a higher low counts)"),
+        ("Turn", price > a20 and a20 > a20p, "back above a rising 20-day average"),
+        ("Base", price > a50, "above its 50-day average"),
+        ("Liquidity", liq_ok, "global liquidity proxy rising or turning up"),
+        ("Dollar", usd_ok, "dollar 2%+ off its 90-day high"),
+    ]
+    n = sum(1 for c in checks if c[1])
+    ok = {c[0]: c[1] for c in checks}
+    if n >= 5 and ok["Washout"] and ok["Base"] and ok["Liquidity"]: tier, st = "Bottom confirmed: buy in size", G
+    elif n >= 3: tier, st = "Bottoming: build a 1/3 position", Y
+    else: tier, st = "No bottom yet", R
+    return dict(n=n, checks=checks, tier=tier, st=st, mdd=mdd, blocked=[])
+
+def trap_guards(core, S, P, capitulation, lay_trend):
+    """Bull-trap guards. Each: (name, passed, reading, applies_to or None for all).
+    A 'buy in size' signal is blocked while any guard that applies to the asset fails."""
+    L = {l["key"]: l for l in core}
+    g = []
+    reg_red = sum(1 for l in core if l["st"] == R) >= 4
+    g.append(("No crisis underway", not reg_red or capitulation,
+              f"{sum(1 for l in core if l['st'] == R)} of 6 crisis lights red" + (" (capitulation already on)" if capitulation and reg_red else ""), None))
+    hy = S["BAMLH0A0HYM2"]; v, v1 = at(hy, TODAY), at(hy, TODAY - days(30)); hmax = max_between(hy, TODAY - days(120), TODAY)
+    widening = num(v, v1) and (v - v1 >= 0.5 or (v >= 5 and num(hmax) and hmax - v < 0.25))
+    g.append(("Credit spreads not widening", num(v, v1) and not widening,
+              f"junk spread {v:.2f}%, {v - v1:+.2f} in 1 mo" if num(v, v1) else "n/a", None))
+    for key, nm in [("funding", "Funding markets calm"), ("dollar", "Dollar not spiking"), ("japan", "No yen carry unwind"), ("fed", "Fed not hiking into weakness")]:
+        l = L.get(key)
+        g.append((nm, bool(l) and l["st"] != R, f"{l['name']}: {WORD[l['st']].lower()}" if l else "n/a", None))
+    mv = P.get("^MOVE")
+    if mv:
+        a, b = mv["price"], at(mv["series"], TODAY - days(30))
+        g.append(("Bond market calm", a < 130 and (not num(b) or a - b < 20), f"MOVE {a:.0f}" + (f", {a - b:+.0f} in 1 mo" if num(b) else ""), None))
+    vt = at(S["X:VIXT"], TODAY)
+    g.append(("Stocks not in active panic", (not num(vt) or vt < 1.0) or capitulation,
+              f"VIX curve {vt:.2f}x" + (" (inverted)" if num(vt) and vt >= 1 else "") if num(vt) else "n/a", None))
+    c, c3 = at(S["IC4WSA"], TODAY), at(S["IC4WSA"], TODAY - days(91))
+    jobs_bad = (num(c, c3) and c / c3 - 1 >= 0.15) or lay_trend == "Rising"
+    g.append(("Layoffs not accelerating", not jobs_bad,
+              (f"claims {pct(c / c3 - 1)} in 3 mo" if num(c, c3) else "claims n/a") + f", announced cuts {(lay_trend or 'n/a').lower()}",
+              ("BTC-USD", "SI=F")))
+    return g
+
+FAIL_LABEL = {'No crisis underway': 'crisis underway', 'Credit spreads not widening': 'credit widening', 'Funding markets calm': 'funding stress', 'Dollar not spiking': 'dollar spike', 'No yen carry unwind': 'yen carry unwind', 'Fed not hiking into weakness': 'Fed hiking into weakness', 'Bond market calm': 'bond market stress', 'Stocks not in active panic': 'panic in stocks', 'Layoffs not accelerating': 'layoffs accelerating'}
+
+def apply_guards(bottoms, guards):
+    for b in bottoms:
+        fails = [FAIL_LABEL.get(nm, nm) for nm, ok, _, who in guards if not ok and (who is None or b["sym"] in who)]
+        b["blocked"] = fails
+        if fails and b["st"] == G:
+            b["tier"], b["st"] = "Bottom pattern, but blocked: 1/3 max", Y
+
+def djc_trend(weeks):
+    full = [w for w in weeks if not w["partial"]]
+    rec, base = full[-4:], full[-12:-4]
+    ra = sum(w["jobs"] for w in rec) / max(len(rec), 1); ba = sum(w["jobs"] for w in base) / max(len(base), 1)
+    chg = ra / ba - 1 if ba else None
+    if not num(chg): return None, None
+    return ("Rising" if chg >= 0.25 else "Easing" if chg <= -0.20 else "Steady"), chg
 
 # =========================================================================== watchlist logic
 
@@ -701,19 +1019,22 @@ def signal(regime, setup, trend):
 FRED_IDS = sorted(({g[2] for g in GAUGES} | {"IORB", "FGRECPT", "DFF", "WALCL", "DGS2", "DEXJPUS", "IRLTLT01JPM156N",
     "WFRBST01134", "WFRBSB50215", "LNS14000036", "CES6054150001", "USINFO", "TEMPHELPS", "JTSQUR",
     "CUSR0000SAF11", "CUSR0000SAH1", "CUSR0000SEHF01", "CUSR0000SETE", "UMCSENT", "DRCRELEXFACBS", "BAMLH0A3HYC",
-    "RIFSPPFAAD90NB", "DTB3", "IC4WSA", "JTSLDR", "IHLIDXUS", "TDSP"} | {w[0] for w in WHITE_COLLAR}) - {"X:CP", "X:CCCHY", "X:VIXT", "X:BREADTH"})
-LONG_IDS = ["BCNSDODNS", "CMDEBT", "CSUSHPINSA", "GDP"]
+    "RIFSPPFAAD90NB", "DTB3", "IC4WSA", "JTSLDR", "IHLIDXUS", "TDSP", "WTREGEN", "RRPONTSYD", "WRESBAL", "ECBASSETSW", "DEXUSEU",
+    "JPNASSETS", "THREEFYTP10", "USALOLITOAASTSAM", "NOCDFSA066MSFRBPHI", "NOCDINA066MNFRBNY", "PERMIT", "SUBLPDRCSN",
+    "STDSAUTO", "NFCIRISK"} | {w[0] for w in WHITE_COLLAR}) - {"X:CP", "X:CCCHY", "X:VIXT", "X:BREADTH", "X:EBP"})
+LONG_IDS = ["BCNSDODNS", "CMDEBT", "CSUSHPINSA", "GDP", "NCBEILQ027S"]
 
 def build():
     S = {i: fred(i) for i in FRED_IDS}
     S.update({i: fred(i, days=26000) for i in LONG_IDS})
-    P = {sym: prices(sym) for sym in ["JPY=X", "SPY", "RSP", "^VIX", "^VIX3M", "BIZD", "KRE", "GC=F", "SI=F", "BTC-USD", "GLD", "SLV", "GDX"]}
+    P = {sym: prices(sym) for sym in ["JPY=X", "SPY", "RSP", "^VIX", "^VIX3M", "^MOVE", "BIZD", "KRE", "GC=F", "SI=F", "BTC-USD", "GLD", "SLV", "GDX"]}
     ser = lambda sym: (P.get(sym) or {}).get("series") or []
     # derived series
     S["X:CP"] = join(S["RIFSPPFAAD90NB"], S["DTB3"], lambda a, b: (a - b) * 100)
     S["X:CCCHY"] = join(S["BAMLH0A3HYC"], S["BAMLH0A0HYM2"], lambda a, b: a / b)
     S["X:VIXT"] = join(ser("^VIX"), ser("^VIX3M"), lambda a, b: a / b)
     S["X:BREADTH"] = join(ser("RSP"), ser("SPY"), lambda a, b: a / b)
+    S["X:EBP"], S["X:EBPPROB"] = ebp()
     spx = prices_long("^GSPC")
     dj = djc()
 
@@ -731,6 +1052,12 @@ def build():
     regime = override or calc
     reds = sum(1 for l in core if l["st"] == R); yels = sum(1 for l in core if l["st"] == Y)
     reds_prev = sum(1 for l in core_prev if l["st"] == R)
+
+    # ---- prediction markets
+    fedodds = kalshi_fed(); polys = poly_watch()
+
+    # ---- recession watch
+    rwatch = recession_watch(S, TODAY); rwatch_prev = recession_watch(S, MONTH_AGO)
 
     # ---- gauges
     gauges = []
@@ -821,11 +1148,79 @@ def build():
                          "Dale: window passed without a crash", "Karsan: bear market by mid-2027"))
     nd = sum(1 for x in duel if x[2] == "Dale"); nk = sum(1 for x in duel if x[2] == "Karsan")
 
+    # ---- liquidity and bottoms
+    us_liq, g_liq = liquidity(S)
+    lq = g_liq if len(g_liq) > 20 else us_liq
+    lstate, ltone, lm6, lm13 = liq_state(lq, TODAY)
+    lstate_prev = liq_state(lq, MONTH_AGO)[0]
+    liq_ok = lstate in ("Rising", "Turning up")
+    dxy_hi = max_between(S["DTWEXBGS"], TODAY - days(90), TODAY); dxy_now = at(S["DTWEXBGS"], TODAY)
+    usd_ok = num(dxy_hi, dxy_now) and dxy_now / dxy_hi - 1 <= -0.02
+    bottoms = []
+    for sym, (nm, wash) in BOTTOM_CFG.items():
+        p = P.get(sym)
+        if p and len(p["closes"]) > 60:
+            bottoms.append(dict(sym=sym, name=nm, price=p["price"], **bottom_score(p, wash, liq_ok, usd_ok)))
+
+    liq_rows = []
+    def lrow(name, value, st, delta, worse, sp, asof, meaning, rule):
+        liq_rows.append(dict(name=name, value=value, st=st, delta=delta, worse=worse, spark=sp, asof=asof, meaning=meaning, rule=rule))
+    if lq:
+        lrow("Global liquidity proxy" if lq is g_liq else "US net liquidity", f"${last(lq)[1]:.1f}T", ltone,
+             f"{pct(lm13)} in 13 wks" if num(lm13) else None, (lm13 < 0) if num(lm13) else None, [v for d, v in lq if d >= TODAY - days(730)], last(lq)[0],
+             "Fed balance sheet minus Treasury cash and reverse repo, plus the ECB and Bank of Japan balance sheets in dollars. A free stand-in for Howell's index, which also includes China and private credit.",
+             "Green: rising over 6 and 13 weeks. Yellow: turning up or rolling over. Red: falling")
+    if us_liq:
+        a, b = at(us_liq, TODAY), at(us_liq, TODAY - days(91))
+        if num(a, b):
+            lrow("US net liquidity", f"${a:.2f}T", G if a > b * 1.01 else R if a < b * 0.99 else Y, f"{pct(a / b - 1)} in 13 wks", a < b,
+                 [v for d, v in us_liq if d >= TODAY - days(730)], last(us_liq)[0],
+                 "Fed balance sheet minus the Treasury's cash account and reverse repo. Howell finds Bitcoin tracks Fed liquidity most closely.",
+                 "Green: up 1%+ in 13 weeks. Red: down 1%+")
+    a, b = at(S["WRESBAL"], TODAY), at(S["WRESBAL"], TODAY - days(91))
+    if num(a, b):
+        lrow("Bank reserves", f"${a/1000:.2f}T", G if a > b * 1.02 else R if a < b * 0.98 else Y, f"{pct(a / b - 1)} in 13 wks", a < b,
+             tail(S, "WRESBAL", 730), last(S["WRESBAL"])[0], "Cash banks hold at the Fed. Howell says rising reserves would change his bearish view.",
+             "Green: up 2%+ in 13 weeks. Red: down 2%+")
+    a, b = at(S["THREEFYTP10"], TODAY), at(S["THREEFYTP10"], TODAY - days(91))
+    if num(a, b):
+        lrow("10-yr term premium", f"{a:.2f}%", level(a, "up", 0.75, 1.25), f"{a - b:+.2f} pts in 3 mo", a > b,
+             tail(S, "THREEFYTP10", 730), last(S["THREEFYTP10"])[0], "Extra yield for holding long bonds. Rising = collateral losing value and liquidity draining.",
+             "Yellow at 0.75%, red at 1.25%")
+    mv = P.get("^MOVE")
+    if mv:
+        a, b = mv["price"], at(mv["series"], TODAY - days(30))
+        lrow("MOVE (bond volatility)", f"{a:.0f}", level(a, "up", 110, 140), f"{a - b:+.0f} in 1 mo" if num(b) else None, (a > b) if num(b) else None,
+             mv["closes"][-180:], TODAY, "Bond-market fear. High MOVE means bigger haircuts on collateral, which shrinks liquidity.",
+             "Yellow at 110, red at 140")
+    btc = P.get("BTC-USD"); gld = P.get("GC=F")
+    howell = []
+    if btc:
+        held = min([c for d, c in btc["series"] if d >= TODAY - days(28)] or [0])
+        howell.append(("Bitcoin holding above $70,000 (4 weeks)", f"4-week low {money(held)}", held >= 70000))
+    a, b = at(S["WRESBAL"], TODAY), at(S["WRESBAL"], TODAY - days(91))
+    howell.append(("Bank reserves being pushed up", f"{pct(a / b - 1)} in 13 weeks" if num(a, b) else "n/a", num(a, b) and a > b * 1.02))
+    if btc and gld:
+        ratio = [(d, c / at(gld["series"], d)) for d, c in btc["series"] if num(at(gld["series"], d))]
+        if ratio:
+            rv = [v for _, v in ratio]; pos = (rv[-1] - min(rv)) / (max(rv) - min(rv)) if max(rv) > min(rv) else 0.5
+            howell.append(("Bitcoin cheap vs gold (sentiment washed out)", f"{rv[-1]:.1f} oz of gold per BTC, {pos*100:.0f}% of its 1-yr range", pos <= 0.2))
+    # lead chart: liquidity 6-wk change advanced 13 weeks vs BTC 6-wk change
+    lead = None
+    if btc and len(lq) > 30:
+        pts_l = [(d + days(91), momentum(lq, d, 42)) for d, _ in lq if d >= TODAY - days(365 + 91)]
+        pts_b = [(d, momentum(btc["series"], d, 42)) for d, _ in btc["series"][::7] if d >= TODAY - days(365)]
+        lead = dict(l=[(d, v) for d, v in pts_l if num(v)], b=[(d, v) for d, v in pts_b if num(v)])
+
     # ---- main street, jobs, build-up
     ms = main_street(S, P)
     jb = jobs(S, P, dj)
     bu = buildup(S, spx)
     weeks = djc_weeks(dj) if dj.get("ok") else []
+    lay_trend = djc_trend(weeks)[0] if weeks else None
+    guards = trap_guards(core, S, P, capitulation, lay_trend)
+    apply_guards(bottoms, guards)
+    nb_conf = sum(1 for b in bottoms if b["st"] == G); nb_bot = sum(1 for b in bottoms if b["st"] in (G, Y))
     wc = []
     for sid, nm in WHITE_COLLAR:
         v, v3 = at(S[sid], TODAY), at(S[sid], TODAY - days(91))
@@ -842,7 +1237,8 @@ def build():
         p = P.get(sym)
         if p and len(p["closes"]) > 25:
             m = tech(p)
-            hard.append(dict(name=nm, sub=sub, price=p["price"], st=price_status(m), spark=p["closes"], **m))
+            bs = next((b_ for b_ in bottoms if b_["sym"] == sym), None)
+            hard.append(dict(name=nm, sub=sub, price=p["price"], st=price_status(m), spark=p["closes"], bscore=bs["n"] if bs else None, **m))
         else:
             hard.append(dict(name=nm, sub=sub, price=None, st=N, spark=[], day=None, m1=None, off_high=None, trend=""))
     g_, s_, brent = (P["GC=F"] or {}).get("price"), (P["SI=F"] or {}).get("price"), at(S["DCOILBRENTEU"], TODAY)
@@ -869,13 +1265,25 @@ def build():
     os.makedirs(OUT, exist_ok=True)
     d = dict(regime=regime, calc=calc, calc_prev=calc_prev, override=override, core=core, reds=reds, yels=yels,
              reds_prev=reds_prev, gauges=gauges, pivots=pivots, npiv=npiv, caps=caps, ncap=ncap, capitulation=capitulation,
-             fp=fp, fed_light=core[-1], duel=duel, nd=nd, nk=nk, ms=ms, jb=jb, bu=bu, weeks=weeks, dj=dj, wc=wc, wc_all=wc_all, hard=hard, ratios=ratios, watch=watch, off=off)
+             fp=fp, fed_light=core[-1], fedodds=fedodds, polys=polys, rwatch=rwatch, rwatch_prev=rwatch_prev, lstate=lstate, ltone=ltone, lstate_prev=lstate_prev, liq_rows=liq_rows, bottoms=bottoms,
+             nb_conf=nb_conf, nb_bot=nb_bot, howell=howell, guards=guards, lead=lead, liq_ok=liq_ok, usd_ok=usd_ok, duel=duel, nd=nd, nk=nk, ms=ms, jb=jb, bu=bu, weeks=weeks, dj=dj, wc=wc, wc_all=wc_all, hard=hard, ratios=ratios, watch=watch, off=off)
+    prev_hist = load_history()
+    snap = make_snapshot(d)
+    d["snap"] = snap
+    if MOCK: prev_hist = mock_history(snap)
+    wk = [h for h in prev_hist if dt.datetime.fromisoformat(h["t"]) <= NOW - dt.timedelta(days=6.5)]
+    d["odds_week"] = (wk[-1] if wk else {}).get("odds", {})
+    run_alerts(prev_hist[-1] if prev_hist else None, snap)
+    hist = save_history(prev_hist, snap)
+    json.dump(hist, open(os.path.join(OUT, "history.json"), "w"), separators=(",", ":"))
     open(os.path.join(OUT, "index.html"), "w").write(render(d))
     open(os.path.join(OUT, "manifest.webmanifest"), "w").write(json.dumps({
         "name": "System Health", "short_name": "Sys Health", "start_url": "./", "display": "standalone",
         "background_color": "#0f1a14", "theme_color": "#0f1a14", "icons": [{"src": "icon.png", "sizes": "180x180", "type": "image/png"}]}))
     write_icon(os.path.join(OUT, "icon.png"))
-    slim = {"updated": NOW.isoformat(), "regime": regime, "regime_month_ago": calc_prev,
+    slim = {"updated": NOW.isoformat(), "regime": regime, "regime_month_ago": calc_prev, "liquidity": lstate,
+            "recession_watch": [[n_, bool(l_), r_] for n_, l_, r_ in rwatch],
+            "bottoms": [{k: v for k, v in b_.items() if k != "checks"} | {"checks": [[c[0], bool(c[1])] for c in b_["checks"]]} for b_ in bottoms],
             "crisis_core": [{k: v for k, v in l.items()} for l in core],
             "gauges": [{k: v for k, v in g.items() if k != "spark"} for g in gauges],
             "main_street": [{k: v for k, v in r.items() if k != "spark"} for r in ms],
@@ -884,6 +1292,146 @@ def build():
     json.dump({"fetched": dj.get("fetched"), "ok": dj.get("ok"), "ests": dj.get("ests", {}),
                "entries": [(str(d_), n_, j_) for d_, n_, j_ in dj.get("entries", [])]}, open(os.path.join(OUT, "djc.json"), "w"))
     print(f"Built: regime {regime} (month ago {calc_prev}), {reds} red / {yels} yellow lights, {len(watch)} tickers")
+
+# =========================================================================== push alerts (ntfy)
+# Compares this run with the previous one and sends only important changes. Each alert type has a 24-hour cooldown.
+
+def site_url():
+    if REPO and "/" in REPO:
+        owner, repo = REPO.split("/", 1)
+        return f"https://{owner.lower()}.github.io/{repo}/"
+    return ""
+
+def find_alerts(prev, now):
+    """Returns list of (key, priority 1-5, title, body)."""
+    if not prev: return []
+    A = []
+    RK = {"GREEN": 0, "YELLOW": 1, "RED": 2}
+    pr, nr = prev.get("regime"), now["regime"]
+    if pr in RK and nr in RK and pr != nr:
+        worse = RK[nr] > RK[pr]
+        A.append((f"regime-{nr}", 5 if nr == "RED" else 4, f"Regime {'worsened' if worse else 'improved'}: {pr} \u2192 {nr}",
+                  f"{sum(1 for v in now['lights'].values() if v == 'RED')} of 6 crisis lights red."))
+    for k, st in now["lights"].items():
+        was = prev.get("lights", {}).get(k)
+        if st == "RED" and was in ("GREEN", "YELLOW"):
+            A.append((f"light-{k}", 4, f"Crisis light red: {k}", f"Now {now.get('lightv', {}).get(k, '')}. Was {was.lower()}."))
+    pw, nw = prev.get("rw"), now["rw"]
+    if pw is not None and nw > pw and nw >= 2:
+        new = [x for x in now["rw_lit"] if x not in prev.get("rw_lit", [])]
+        A.append((f"rw-{nw}", 5 if nw >= 4 else 4, f"Recession watch: {pw} \u2192 {nw} of 8 lit", ("New: " + ", ".join(new)) if new else ""))
+    pl, nl = prev.get("liq"), now["liq"]
+    if pl and nl and pl != nl and nl in ("Turning up", "Falling", "Rising"):
+        A.append((f"liq-{nl}", 4 if nl == "Turning up" else 3, f"Liquidity: {pl} \u2192 {nl}",
+                  "Howell's lead suggests Bitcoin follows in roughly 13 weeks." if nl in ("Turning up", "Rising") else "Liquidity draining. Hard-asset bottoms less likely to hold."))
+    for nm, (n, st) in now["bottoms"].items():
+        was = prev.get("bottoms", {}).get(nm, [0, ""])
+        if st == "GREEN" and was[1] != "GREEN":
+            A.append((f"bottom-{nm}", 5, f"BUY SIGNAL: {nm} bottom confirmed", f"Score {n} of 6, liquidity rising, all bull-trap guards clear."))
+    if (prev.get("cap") or 0) < 3 <= now["cap"]:
+        A.append(("capitulation", 5, "Capitulation signal ON", "Blood in the streets: start buying in 1/3 tranches even if the regime is red."))
+    if (prev.get("piv") or 0) < 2 <= now["piv"]:
+        A.append(("pivot", 4, f"Fed/Treasury pivot forming: {now['piv']} of 5", "Consider a first tranche of dry powder."))
+    po, no = prev.get("odds", {}), now.get("odds", {})
+    if no.get("fed0:date") == po.get("fed0:date"):
+        a_, b_ = po.get("fed0:hike_big", 0), no.get("fed0:hike_big", 0)
+        if b_ >= 0.30 > a_:
+            A.append(("odds-bighike", 4, f"Odds of a 50 bp hike jump to {b_*100:.0f}%", f"Kalshi, Fed meeting {no.get('fed0:date')}. Policy-error risk rising."))
+    for k, v in no.items():
+        if k.startswith("poly:") and "recession" in k.lower() and isinstance(v, float):
+            pv = po.get(k)
+            for th in (0.30, 0.50):
+                if isinstance(pv, float) and pv < th <= v:
+                    A.append((f"odds-rec-{int(th*100)}", 4, f"Market recession odds cross {int(th*100)}%", f"Polymarket now {v*100:.0f}%, was {pv*100:.0f}%."))
+    newg = [g for g in now.get("guards_fail", []) if g not in prev.get("guards_fail", [])]
+    if newg:
+        A.append(("guards-" + "-".join(sorted(newg)), 3, f"Bull-trap warning: {', '.join(FAIL_LABEL.get(g, g) for g in newg)}", "Full-size hard-asset buys are blocked until it clears."))
+    return A
+
+def ntfy_send(title, body, priority=3, tags="chart_with_downwards_trend"):
+    if MOCK or not NTFY_TOPIC:
+        print(f"[alert p{priority}] {title} | {body}"); return
+    try:
+        payload = {"topic": NTFY_TOPIC, "title": title, "message": body or " ", "priority": int(priority),
+                   "tags": [tags], "click": site_url() or None}
+        req = urllib.request.Request("https://ntfy.sh/", data=json.dumps({k: v for k, v in payload.items() if v is not None}).encode("utf-8"),
+                                     method="POST", headers={"Content-Type": "application/json", "User-Agent": UA["User-Agent"]})
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception as e:
+        print(f"ntfy failed: {e}")
+
+def run_alerts(prev, snap):
+    sent = dict(prev.get("alerts", {})) if prev else {}
+    snap["alerts"] = sent
+    if not NTFY_TOPIC and not MOCK: return
+    if prev and not prev.get("alerts_on"):
+        ntfy_send("Dashboard alerts connected", f"You'll get a push when something important changes. Regime now {snap['regime']}.", 3, "white_check_mark")
+    snap["alerts_on"] = True
+    for key, pri, title, body in find_alerts(prev, snap):
+        last_t = sent.get(key)
+        if last_t and (NOW - dt.datetime.fromisoformat(last_t)).total_seconds() < 24 * 3600: continue
+        tag = "rotating_light" if pri >= 5 else "warning" if "worse" in title.lower() or "red" in title.lower() else "bell"
+        ntfy_send(title, body, pri, tag); sent[key] = NOW.isoformat(timespec="seconds")
+    # Monday digest: first run after 12:00 UTC on Mondays
+    wk = NOW.strftime("%G-W%V")
+    if NOW.weekday() == 0 and NOW.hour >= 12 and sent.get("digest") != wk:
+        lights = ", ".join(f"{k.split()[0]} {v.lower()}" for k, v in snap["lights"].items())
+        bt = ", ".join(f"{k} {v[0]}/6" for k, v in snap["bottoms"].items())
+        ntfy_send(f"Weekly: regime {snap['regime']}, recession {snap['rw']}/8, liquidity {snap['liq'].lower()}",
+                  f"Lights: {lights}. Bottom scores: {bt}.", 2, "calendar")
+        sent["digest"] = wk
+    snap["alerts"] = {k: v for k, v in sent.items() if k == "digest" or (NOW - dt.datetime.fromisoformat(v)).days < 7}
+
+# =========================================================================== snapshot for "what changed"
+
+LIQ_RANK = {"Rising": 0, "Turning up": 1, "Rolling over": 2, "Falling": 3, "No data": None}
+
+def make_snapshot(d):
+    rw_lit = [n for n, lit, _ in d["rwatch"] if lit]
+    sts = lambda rows: {r["name"]: r["st"] for r in rows}
+    return {
+        "t": NOW.isoformat(timespec="seconds"),
+        "regime": d["regime"],
+        "lights": {l["name"]: l["st"] for l in d["core"]},
+        "lightv": {l["name"]: l["value"] for l in d["core"]},
+        "rw": len(rw_lit), "rw_lit": rw_lit,
+        "liq": d["lstate"],
+        "guards_fail": [nm for nm, ok, _, _ in d["guards"] if not ok],
+        "bottoms": {b["name"]: [b["n"], b["st"]] for b in d["bottoms"]},
+        "cap": d["ncap"], "piv": d["npiv"],
+        "fed": d["fed_light"]["st"],
+        "gauges": {g["name"]: [g["st"], fmt(g["v"], g["unit"]) if not g.get("vtext") else g["vtext"]] for g in d["gauges"]},
+        "jobs": sts(d["jb"]), "main": sts(d["ms"]), "build": sts(d["bu"]),
+        "odds": odds_flat(d),
+    }
+
+def odds_flat(d):
+    o = {}
+    for i, m in enumerate(d.get("fedodds", [])):
+        hikes = m["odds"].get("hike25", 0) + m["odds"].get("hike_big", 0); cuts = m["odds"].get("cut25", 0) + m["odds"].get("cut_big", 0)
+        o[f"fed{i}:hike"] = round(hikes, 4); o[f"fed{i}:cut"] = round(cuts, 4); o[f"fed{i}:hike_big"] = round(m["odds"].get("hike_big", 0), 4)
+        o[f"fed{i}:date"] = str(m["date"])
+    for pm in d.get("polys", []):
+        o["poly:" + pm["label"]] = round(pm["p"], 4)
+    return o
+
+def mock_history(snap):
+    """Sample data only: fake older snapshots so the panel can be tested."""
+    out = []
+    for k, tweak in [(30, 2), (8, 1), (3, 1), (1, 0)]:
+        s = json.loads(json.dumps(snap))
+        s["t"] = (NOW - dt.timedelta(days=k)).isoformat(timespec="seconds")
+        if tweak >= 1:
+            s["regime"] = "YELLOW"; first = next(iter(s["lights"])); s["lights"][first] = "RED"
+            s["rw"] = snap["rw"] + 1; s["rw_lit"] = snap["rw_lit"] + ["Jobless claims up 15%+"]
+            for i, name in enumerate(list(s["gauges"])[:6]):
+                s["gauges"][name][0] = {"GREEN": "YELLOW", "YELLOW": "RED", "RED": "YELLOW"}.get(s["gauges"][name][0], "GREEN") if i % 2 == 0 else s["gauges"][name][0]
+        if "odds" in s:
+            s["odds"] = {k: (round(max(0, min(1, v - 0.05 * tweak)), 4) if isinstance(v, float) else v) for k, v in s["odds"].items()}
+        if tweak == 2:
+            s["liq"] = "Falling"; s["guards_fail"] = snap["guards_fail"] + ["Credit spreads not widening"]
+        out.append(s)
+    return out
 
 # =========================================================================== render
 
@@ -937,6 +1485,47 @@ def render(d):
         core.append(f'''<details class="light s-{t}" id="light-{l["key"]}"><summary><div class="lt"><span class="lamp"></span>{E(l["name"])}</div>
 <div class="lv">{E(l["value"])}</div><div class="ld">{E(l["detail"])}</div>{was}</summary><div class="lr">{E(l["rule"])}</div></details>''')
 
+    # ---------------- recession watch
+    rw, rwp = d["rwatch"], d["rwatch_prev"]
+    nrw, nrwp = sum(1 for x in rw if x[1]), sum(1 for x in rwp if x[1])
+    rw_tone = "red" if nrw >= 4 else "yellow" if nrw >= 2 else "green"
+    rw_word = "High recession risk: signals clustering" if nrw >= 4 else "Watch: some warning signs" if nrw >= 2 else "Low recession risk"
+    rw_trend = f"&#9650; up from {nrwp} a month ago" if nrw > nrwp else f"&#9660; down from {nrwp} a month ago" if nrw < nrwp else "same as a month ago"
+    rw_cls = "worse" if nrw > nrwp else "better" if nrw < nrwp else "flat"
+    rw_items = "".join(f'''<li class="{"lit" if lit else ""}"><span class="rl"></span><div><b>{E(n)}</b><small>{E(r)}</small></div></li>''' for n, lit, r in rw)
+
+    # ---------------- market odds
+    ow = d.get("odds_week", {}) or {}
+    def wchg(key, v, bad_up=True):
+        pv = ow.get(key)
+        if not isinstance(pv, float) or not num(v): return ""
+        dd = v - pv
+        if abs(dd) < 0.005: return '<span class="arr flat">&#9644; flat vs 1 wk</span>'
+        worse = (dd > 0) if bad_up else (dd < 0)
+        return f'<span class="arr {"worse" if worse else "better"}">{"&#9650;" if dd > 0 else "&#9660;"} {abs(dd)*100:.0f} pts vs 1 wk</span>'
+    odds_html = ""
+    fo = d.get("fedodds") or []
+    if fo:
+        m0 = fo[0]; order = [("hike_big", "Hike more than 25 bp", "red"), ("hike25", "Hike 25 bp", "yellow"), ("hold", "Hold", "grey"),
+                             ("cut25", "Cut 25 bp", "green"), ("cut_big", "Cut more than 25 bp", "green")]
+        bars = "".join(f'''<li class="s-{tone}"><span>{E(nm)}</span><div class="track"><i style="width:{max(1, m0["odds"].get(k, 0)*100):.1f}%"></i></div><b>{m0["odds"].get(k, 0)*100:.0f}%</b></li>'''
+                       for k, nm, tone in order if m0["odds"].get(k, 0) >= 0.005 or k in ("hike25", "hold", "cut25"))
+        later = "".join(f'''<li><b>{E(m["label"])}</b><span>hike {(m["odds"].get("hike25",0)+m["odds"].get("hike_big",0))*100:.0f}% &middot; hold {m["odds"].get("hold",0)*100:.0f}% &middot; cut {(m["odds"].get("cut25",0)+m["odds"].get("cut_big",0))*100:.0f}%</span></li>''' for m in fo[1:])
+        hk = m0["odds"].get("hike25", 0) + m0["odds"].get("hike_big", 0)
+        odds_html += f'''<div class="odd"><div class="djh"><b>Next Fed meeting: {E(m0["label"])}</b>{wchg("fed0:hike", hk)}</div>
+<ul class="obars">{bars}</ul>{f'<ul class="olater">{later}</ul>' if later else ''}
+<p class="muted fine">Kalshi (CFTC-regulated), mid of bid and ask. A rising chance of a hike is colored as worse.</p></div>'''
+    GOODW = ("normal", "reopen", "ceasefire", "peace", "deal", "agreement", "avoid")
+    def pm_row(pm):
+        q = (pm["question"] or "").lower(); yes_good = any(w in q for w in GOODW); pv = pm["p"]
+        bad = (1 - pv) if yes_good else pv
+        tone = "red" if bad >= 0.5 else "yellow" if bad >= 0.25 else "grey"
+        return f'''<li><div><b>{E(pm["label"])}</b><small>{E(pm["question"] or "")}{(" &middot; ends " + E(pm["end"])) if pm.get("end") else ""}</small></div>
+<div class="oy"><span class="pill s-{tone}">{pv*100:.0f}%</span>{wchg("poly:" + pm["label"], pv, not yes_good)}</div></li>'''
+    pm_rows = "".join(pm_row(pm) for pm in d.get("polys", []))
+    if pm_rows:
+        odds_html += f'''<ul class="pml">{pm_rows}</ul><p class="muted fine">Polymarket, chance of "Yes". The code picks the most-traded open contract matching each topic and rolls to new ones as old ones expire.</p>'''
+
     # ---------------- checklists (blood, pivot)
     def checklist(items):
         return "".join(f'''<li class="{'hit' if hit else ''}"><span class="dot"></span><div><b>{E(n)}</b><small>{E(reading)} &middot; trigger: {E(trig)}</small></div><span class="yn">{'YES' if hit else 'no'}</span></li>'''
@@ -960,7 +1549,8 @@ def render(d):
         frow("Jobless claims, 4 wks vs 3 mo ago", pct(fp["claims"]), (fp["claims"] >= 0.10) if num(fp["claims"]) else None, "Up 10%+ = layoffs building"),
         frow("Junk spreads, 1 mo", (f"{fp['hy']:+.2f} pts" if num(fp["hy"]) else "n/a"), (fp["hy"] >= 0.5) if num(fp["hy"]) else None, "Up 0.5+ = credit tightening"),
         frow("Temp help jobs, 1 yr", pct(fp["temp"]), (fp["temp"] <= -0.03) if num(fp["temp"]) else None, "Down 3%+ = firms cutting"),
-    ])
+    ] + ([frow(f"Odds of a 50 bp hike, {d['fedodds'][0]['label']}", f"{d['fedodds'][0]['odds'].get('hike_big', 0)*100:.0f}%",
+               d['fedodds'][0]['odds'].get('hike_big', 0) >= 0.30, "Kalshi prediction market. 30%+ = an outsized hike is a live risk")] if d.get("fedodds") else []))
     fed_verdict = {R: "Policy error risk HIGH: hiking into a weakening economy", Y: "Policy is tight. Watch for the data to crack",
                    G: "No sign of a policy error", N: "No data"}[fl["st"]]
 
@@ -1042,6 +1632,57 @@ def render(d):
     bu_red = sum(1 for r in bu if r["st"] == R)
     bu_tone = "red" if bu_red else "yellow" if any(r["st"] == Y for r in bu) else "green"
 
+    # ---------------- liquidity and bottoms
+    bt = d["bottoms"]
+    all_conf = len(bt) == 3 and d["nb_conf"] == 3
+    blocked_any = any(b_["blocked"] and b_["n"] >= 5 for b_ in bt)
+    if all_conf: lverd, lvt = "BUY IN SIZE: Bitcoin, gold and silver bottoms confirmed, liquidity turning up, no bull-trap warnings", "green"
+    elif d["nb_conf"] >= 1: lverd, lvt = f"{d['nb_conf']} of 3 confirmed bottoms. Buy those in size; build the rest in thirds", "green"
+    elif blocked_any: lverd, lvt = "Bottom patterns showing, but bull-trap guards are failing. 1/3 positions at most", "yellow"
+    elif d["nb_bot"] >= 2: lverd, lvt = (f"{d['nb_bot']} of 3 bottoming. Build 1/3 positions; size up as each confirms" if d["liq_ok"] else f"{d['nb_bot']} of 3 bottoming. Build 1/3 positions; wait for liquidity to turn"), "yellow"
+    else: lverd, lvt = "No hard-asset bottom yet. Hold dry powder", "red" if d["ltone"] == R else "grey"
+    cards = []
+    for b_ in bt:
+        dots = "".join(f'<i class="{"on" if c[1] else ""}"></i>' for c in b_["checks"])
+        blk = f'<span class="blk">Blocked: {E(", ".join(b_["blocked"]))}</span>' if b_["blocked"] and b_["n"] >= 3 else ""
+        cards.append(f'''<div class="bcard s-{TONE[b_["st"]]}"><div class="bh"><b>{E(b_["name"])}</b><span>{money(b_["price"])}</span></div>
+<div class="bs"><span class="bn">{b_["n"]}<small>/6</small></span><span class="dots">{dots}</span></div><span class="pill">{E(b_["tier"])}</span>{blk}</div>''')
+    matrix = ""
+    if bt:
+        head = "".join(f"<th>{E(b_['name'])}</th>" for b_ in bt)
+        body_ = ""
+        for i, c in enumerate(bt[0]["checks"]):
+            cells = "".join(f'<td class="{"y" if b_["checks"][i][1] else "n"}">{"&#10003;" if b_["checks"][i][1] else "&#10005;"}</td>' for b_ in bt)
+            body_ += f'<tr><th scope="row">{E(c[0])}<small>{E(re.sub(r" [(]needs.*", "", c[2]) if c[0] != "Washout" else "fell hard from a recent peak")}</small></th>{cells}</tr>'
+        washes = ", ".join(f"{E(b_['name'])} {BOTTOM_CFG[b_['sym']][1]*100:.0f}% (now {pct(b_['mdd'], False).lstrip('-')})" for b_ in bt)
+        matrix = f'''<table class="bmx"><thead><tr><th></th>{head}</tr></thead><tbody>{body_}</tbody></table>
+<p class="muted fine">Washout means a drop from a peak in the last 4 months of at least: {washes}.</p>'''
+    gd = d["guards"]; gfail = [x for x in gd if not x[1]]
+    gl = "".join(f'''<li class="{"ok" if ok else "bad"}"><span class="gk">{"&#10003;" if ok else "&#10005;"}</span><div><b>{E(nm)}</b><small>{E(rd)}{" &middot; applies to Bitcoin and silver" if who else ""}</small></div></li>''' for nm, ok, rd, who in gd)
+    gverd = (f"All {len(gd)} guards clear: a bottom signal here is not a bull trap by these measures", "green") if not gfail else \
+            (f"{len(gfail)} of {len(gd)} guards failing: 'buy in size' is blocked until they clear", "red" if len(gfail) >= 3 else "yellow")
+    hw = "".join(f'<li class="{"hit" if hit else ""}"><span class="dot"></span><div><b>{E(n)}</b><small>{E(r)}</small></div><span class="yn">{"YES" if hit else "no"}</span></li>' for n, r, hit in d["howell"])
+    liq_html = "".join(mrow(r["name"], r["value"], r["st"], r["delta"], r["worse"], r["spark"], r["asof"], r["meaning"], r["rule"]) for r in d["liq_rows"])
+    lead_svg = ""
+    ld = d["lead"]
+    if ld and ld["l"] and ld["b"]:
+        W, H = 340, 150; x0, x1 = TODAY - days(365), TODAY + days(91)
+        X = lambda dd: (dd - x0).days / (x1 - x0).days * W
+        sl = max(abs(v) for _, v in ld["l"]) or 1; sb = max(abs(v) for _, v in ld["b"]) or 1
+        Yl = lambda v: H / 2 - v / sl * (H / 2 - 12); Yb = lambda v: H / 2 - v / sb * (H / 2 - 12)
+        lp = [(X(dd), Yl(v)) for dd, v in ld["l"] if x0 <= dd <= x1]
+        bp = [(X(dd), Yb(v)) for dd, v in ld["b"] if x0 <= dd <= x1]
+        area = f"M{lp[0][0]:.1f},{H/2:.1f} " + " ".join(f"L{x:.1f},{y:.1f}" for x, y in lp) + f" L{lp[-1][0]:.1f},{H/2:.1f} Z" if lp else ""
+        bl = " ".join(f"{x:.1f},{y:.1f}" for x, y in bp)
+        tx = X(TODAY)
+        lead_svg = f'''<div class="lead"><div class="djh"><b>Liquidity leads Bitcoin by ~13 weeks</b></div>
+<svg viewBox="0 0 {W} {H}" class="leadc" role="img" aria-label="Liquidity momentum shifted 13 weeks ahead vs Bitcoin momentum">
+<rect x="{tx:.1f}" y="0" width="{W-tx:.1f}" height="{H}" class="fut"/><line x1="0" x2="{W}" y1="{H/2}" y2="{H/2}" class="zero"/>
+<path d="{area}" class="la"/><polyline points="{bl}" class="bl"/><line x1="{tx:.1f}" x2="{tx:.1f}" y1="0" y2="{H}" class="now"/>
+<text x="{tx+4:.1f}" y="12" class="ax">next 13 wks</text><text x="2" y="{H-3}" class="ax">{x0.strftime("%b %Y")}</text></svg>
+<p class="leg"><span><i class="k1"></i>Liquidity, 6-wk change, shifted 13 wks ahead</span><span><i class="k2"></i>Bitcoin, 6-wk change</span></p>
+<p class="muted fine">Both scaled to fit. The shaded area past today is where liquidity points Bitcoin next, per Howell's lead. A guide, not a promise: Howell reports an R-squared of about 0.3.</p></div>'''
+
     # ---------------- dale vs karsan
     nd, nk = d["nd"], d["nk"]; nu = len(d["duel"]) - nd - nk
     lead = "Leaning Dale" if nd > nk else "Leaning Karsan" if nk > nd else "Too close to call"
@@ -1053,7 +1694,7 @@ def render(d):
     hard = "".join(f'''<div class="tile s-{TONE[h["st"]]}"><div class="tn">{E(h["name"])} <small>{E(h["sub"])}</small></div>
 <div class="tp">{money(h["price"])}</div>{spark(h["spark"], 100, 26, "t")}
 <div class="tc"><span class="{chg_class(h['day'])}">{pct(h["day"])} <i>day</i></span><span class="{chg_class(h['m1'])}">{pct(h["m1"])} <i>1 mo</i></span></div>
-<div class="tf">{E(h["trend"])}{' &middot; ' if h["trend"] else ''}{pct(h["off_high"])} from high</div></div>''' for h in d["hard"])
+<div class="tf">{E(h["trend"])}{' &middot; ' if h["trend"] else ''}{pct(h["off_high"])} from high{f' &middot; bottom score {h["bscore"]}/6' if h.get("bscore") is not None else ''}</div></div>''' for h in d["hard"])
     ratios = " &middot; ".join(f'<b>{E(n)}</b> {v:.1f} <span class="muted">({E(note)})</span>' for n, v, note in d["ratios"] if num(v))
 
     # ---------------- watchlist
@@ -1078,6 +1719,8 @@ def render(d):
     upd = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
     ov_note = f'<p class="note">Manual override on. The six lights say {d["calc"]}.</p>' if d["override"] else ""
     cap_note = '<p class="note on">Capitulation signal is ON. See "Blood in the streets".</p>' if d["capitulation"] else ""
+    if len(d["bottoms"]) == 3 and d["nb_conf"] == 3:
+        cap_note += '<p class="note on">BUY IN SIZE: Bitcoin, gold and silver bottoms confirmed with liquidity turning. See "Liquidity".</p>'
     lamps = "".join(f'<a href="#light-{l["key"]}" class="s-{TONE[l["st"]]}"><i></i><span>{SHORT[l["key"]]}</span></a>' for l in d["core"])
 
     body = f'''
@@ -1090,15 +1733,37 @@ def render(d):
 <div><b>{rn} of 6</b><small>crisis lights red ({d["yels"]} yellow)</small></div>
 <div><b class="t-{trend_cls}">{"&#9650; Worse" if trend_cls=="worse" else "&#9660; Better" if trend_cls=="better" else "Unchanged"}</b><small>vs a month ago, when {rp} {"was" if rp==1 else "were"} red and the regime was {regime_prev}</small></div>
 <div><b>{E(deploy)}</b><small>new money to deploy</small></div>
-<div><b>{"ON" if d["capitulation"] else "Off"}</b><small>capitulation signal ({nc} of 5)</small></div>
+<div><b>{nrw} of 8</b><small>recession signals lit ({nrwp} a month ago)</small></div>
+<div><b>{E(d["lstate"])}</b><small>liquidity (a month ago: {E(d["lstate_prev"].lower())})</small></div>
+<div><b>{d["nb_conf"]} of 3</b><small>hard-asset bottoms confirmed ({d["nb_bot"]} bottoming)</small></div>
 </div>{cap_note}{ov_note}
 <div class="stale" id="stale">Data is more than 3 hours old. The hourly update may have paused.</div>
 </div></header>
-<nav class="jump wrap"><a href="#core">Crisis core</a><a href="#blood">Blood</a><a href="#pivot">Pivot</a><a href="#fed">Fed</a><a href="#jobs">Jobs</a><a href="#main">Main St</a><a href="#buildup">Build-up</a><a href="#duel">Dale/Karsan</a><a href="#hard">Hard assets</a><a href="#gauges">Gauges</a><a href="#watch">Watchlist</a></nav>
+<section class="wrap chg" id="changes"><div class="chh"><h2>What changed</h2>
+<div class="chips" role="tablist"><button data-w="last" class="on">Since last visit</button><button data-w="1">1 day</button><button data-w="7">1 week</button><button data-w="30">1 month</button></div></div>
+<div id="chsum" class="verdict s-grey">Loading change history&hellip;</div><ul id="chlist" class="chl"></ul>
+<details id="chmore" hidden><summary>Show all changes</summary><ul id="chall" class="chl"></ul></details>
+<script type="application/json" id="snapnow">{json.dumps(d["snap"]).replace("</", "<\\/")}</script></section>
+<nav class="jump wrap"><a href="#core">Crisis core</a><a href="#recession">Recession</a><a href="#odds">Odds</a><a href="#liq">Liquidity</a><a href="#blood">Blood</a><a href="#pivot">Pivot</a><a href="#fed">Fed</a><a href="#jobs">Jobs</a><a href="#main">Main St</a><a href="#buildup">Build-up</a><a href="#duel">Dale/Karsan</a><a href="#hard">Hard assets</a><a href="#gauges">Gauges</a><a href="#watch">Watchlist</a></nav>
 <div class="legend wrap"><span><i class="s-green"></i>Healthy</span><span><i class="s-yellow"></i>Caution</span><span><i class="s-red"></i>Stress</span><span class="arr better">&#9660; better</span><span class="arr worse">&#9650; worse</span></div>
 <main class="wrap">
 <section id="core"><h2>Crisis core</h2><p class="lede">The six channels behind past breaks. They alone set the regime: 4+ red = RED; 2+ red, with yellows counting half = YELLOW. Tap a light for its trigger.</p>
 <div class="lights">{"".join(core)}</div></section>
+
+<section id="recession"><h2>Recession watch</h2><div class="verdict s-{rw_tone}"><b>{nrw} of 8 lit</b> &middot; {E(rw_word)} <span class="arr {rw_cls}">{rw_trend}</span></div>
+<p class="lede">The classic leading signals. One alone means little; watch for clusters and acceleration. Crisis lights measure financial stress; this measures recession risk. 2022 had stress without a recession.</p>
+<ul class="rwl">{rw_items}</ul></section>
+
+<section id="odds"><h2>Market odds</h2><p class="lede">What real-money prediction markets expect. Context only: these don't set the regime, and thin markets can be noisy.</p>{odds_html or '<p class="muted">Prediction-market data unavailable this hour.</p>'}</section>
+
+<section id="liq"><h2>Liquidity and hard-asset bottoms</h2><div class="verdict s-{lvt}"><b>Liquidity: {E(d["lstate"])}</b> &middot; {E(lverd)}</div>
+<p class="lede">Following Michael Howell: liquidity drives Bitcoin (about 8x sensitive) and gold and silver (about 2x). Each asset gets a 6-point bottom score. "Buy in size" needs 5+ points including a washout, a base above the 50-day and rising liquidity, and every bull-trap guard clear.</p>
+<div class="bcards">{"".join(cards)}</div>{matrix}
+<h3 id="guards">Bull-trap guards</h3><div class="verdict s-{gverd[1]}">{E(gverd[0])}</div>
+<p class="lede">A rebound inside a building credit or funding crisis is a trap. Any failing guard downgrades "buy in size" to 1/3 at most. The crisis and panic guards lift once the capitulation signal is on, because real bottoms come after the panic.</p>
+<ul class="guards">{gl}</ul>{lead_svg}
+<h3>Howell's own change-of-view tests</h3><ul class="chk">{hw}</ul>
+<h3>Liquidity gauges</h3>{liq_html}</section>
 
 <section id="blood"><h2>Blood in the streets</h2><div class="verdict s-{capv[1]}"><b>{nc} of 5</b> {E(capv[0])}</div>
 <p class="lede">Washout signals that marked past bottoms. 3+ turns it on and overrides the regime for buying.</p><ul class="chk">{checklist(d["caps"])}</ul></section>
@@ -1132,11 +1797,81 @@ def render(d):
 <section id="watch"><h2>Watchlist</h2><p class="lede">Each ticker's setup, filtered through the regime. Nothing turns green in a red regime unless the capitulation signal is on. Lines show 6 months. {edit}</p>{"".join(wl) or '<p class="muted">Your watchlist is empty.</p>'}</section>
 </main>
 <footer class="wrap"><p>Data: FRED (St. Louis Fed), Yahoo Finance, Stooq. Rebuilt hourly. Thresholds are rules of thumb from past cycles, not official cutoffs. Not financial advice.</p><p>{ovr}</p></footer>
+<script>%%CHANGES_JS%%</script>
 <script>{{const el=document.getElementById('upd');const t=new Date(el.dataset.t);const m=Math.round((Date.now()-t)/60000);
 el.textContent='Updated '+(m<1?'just now':m<60?m+' min ago':m<1440?Math.round(m/60)+' hr ago':Math.round(m/1440)+' days ago');
 if(m>180)document.getElementById('stale').style.display='block';}}</script>'''
-    return HEAD + body + "\n</body></html>"
+    return HEAD + body.replace("%%CHANGES_JS%%", CHANGES_JS) + "\n</body></html>"
 
+
+CHANGES_JS = r"""
+(function(){
+  const RANK={GREEN:0,YELLOW:1,RED:2,NODATA:null,"NO DATA":null};
+  const LIQ={"Rising":0,"Turning up":1,"Rolling over":2,"Falling":3};
+  const WORD={GREEN:"green",YELLOW:"yellow",RED:"red",NODATA:"no data"};
+  const now=JSON.parse(document.getElementById('snapnow').textContent);
+  const sum=document.getElementById('chsum'), list=document.getElementById('chlist'), more=document.getElementById('chmore'), all=document.getElementById('chall');
+  let hist=[], mode='last', prevVisit=null;
+  try{const cur=+localStorage.getItem('sh_cur')||0, prv=+localStorage.getItem('sh_prev')||0, t=Date.now();
+      if(!cur||t-cur>30*60*1000){ if(cur) localStorage.setItem('sh_prev',cur); localStorage.setItem('sh_cur',t); prevVisit=cur||null; }
+      else { prevVisit=prv||null; }}catch(e){}
+  function ago(ms){const h=ms/36e5; if(h<1) return 'under an hour ago'; if(h<36) return Math.round(h)+' hours ago'; return Math.round(h/24)+' days ago';}
+  function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+  function diff(b){
+    const out=[]; // [weight, dir(+1 worse/-1 better), text]
+    const st=(label,a,c,w,extra)=>{const ra=RANK[a],rc=RANK[c]; if(ra==null||rc==null||ra===rc) return;
+      out.push([w,rc>ra?1:-1,label+': '+WORD[a]+' → '+WORD[c]+(extra?' ('+extra+')':'')]);};
+    if(b.regime!==now.regime && RANK[b.regime]!=null && RANK[now.regime]!=null) out.push([5,RANK[now.regime]>RANK[b.regime]?1:-1,'Regime: '+b.regime+' → '+now.regime]);
+    for(const k in now.lights) st(k,(b.lights||{})[k],now.lights[k],3,(now.lightv||{})[k]);
+    if(b.rw!=null && b.rw!==now.rw){const added=now.rw_lit.filter(x=>!(b.rw_lit||[]).includes(x)), gone=(b.rw_lit||[]).filter(x=>!now.rw_lit.includes(x));
+      out.push([3,now.rw>b.rw?1:-1,'Recession signals: '+b.rw+' → '+now.rw+' of 8'+(added.length?' (new: '+added.join(', ')+')':'')+(gone.length?' (cleared: '+gone.join(', ')+')':'')]);}
+    if(b.liq && LIQ[b.liq]!=null && LIQ[now.liq]!=null && b.liq!==now.liq) out.push([3,LIQ[now.liq]>LIQ[b.liq]?1:-1,'Liquidity: '+b.liq+' → '+now.liq]);
+    const gf=(b.guards_fail||[]).length, gn=(now.guards_fail||[]).length;
+    if(gf!==gn) out.push([2,gn>gf?1:-1,'Bull-trap guards failing: '+gf+' → '+gn]);
+    for(const grp of [['jobs','Jobs'],['main','Main Street'],['build','Build-up']]){const B=b[grp[0]]||{},C=now[grp[0]]||{}; for(const k in C) st(grp[1]+' · '+k,B[k],C[k],1.5);}
+    const BG=b.gauges||{}; for(const k in now.gauges){const c=now.gauges[k], a=BG[k]; if(a) st(k,a[0],c[0],1,(a[1]&&c[1])?a[1]+' → '+c[1]:'');}
+    const opp=[]; const BB=b.bottoms||{};
+    for(const k in now.bottoms){const a=BB[k],c=now.bottoms[k]; if(a&&a[0]!==c[0]) opp.push(k+' bottom score: '+a[0]+' → '+c[0]+' of 6');}
+    if(b.cap!=null&&b.cap!==now.cap) opp.push('Capitulation signals: '+b.cap+' → '+now.cap+' of 5');
+    if(b.piv!=null&&b.piv!==now.piv) opp.push('Pivot signals: '+b.piv+' → '+now.piv+' of 5');
+    return {out,opp};
+  }
+  function pick(){
+    if(!hist.length) return null;
+    let target;
+    if(mode==='last'){ if(!prevVisit) return {first:true}; target=prevVisit; }
+    else target=Date.now()-(+mode)*864e5;
+    let best=null; for(const h of hist){const t=Date.parse(h.t); if(t<=target) best=h;}
+    if(!best) return {early:hist[0]};
+    return best;
+  }
+  function render(){
+    document.querySelectorAll('.chips button').forEach(x=>x.classList.toggle('on',x.dataset.w===mode));
+    list.innerHTML=''; all.innerHTML=''; more.hidden=true;
+    const b=pick();
+    if(!b){sum.className='verdict s-grey'; sum.textContent='Change history is still building. Check back after a few hourly updates.'; return;}
+    if(b.first){sum.className='verdict s-grey'; sum.textContent='First visit on this device. From your next visit, this shows what changed since you last looked.'; return;}
+    if(b.early){sum.className='verdict s-grey'; sum.textContent='History only goes back to '+new Date(b.early.t).toLocaleDateString()+'. Try a shorter window.'; return;}
+    const {out,opp}=diff(b);
+    const worse=out.filter(x=>x[1]>0), better=out.filter(x=>x[1]<0);
+    const score=out.reduce((s,x)=>s+x[0]*x[1],0);
+    const when=ago(Date.now()-Date.parse(b.t));
+    const tone=score>=3?'red':score<=-3?'green':'grey';
+    const dir=score>=3?'Getting worse':score<=-3?'Getting better':'Little net change';
+    sum.className='verdict s-'+tone;
+    sum.innerHTML='<b>'+dir+'</b> since '+esc(when)+' <span class="cc"><span class="arr worse">&#9650; '+worse.length+' worse</span> <span class="arr better">&#9660; '+better.length+' better</span></span>';
+    const sorted=out.slice().sort((x,y)=>(y[1]-x[1])||(y[0]-x[0]));
+    const li=x=>'<li class="'+(x[1]>0?'w':'b')+'"><span class="arr '+(x[1]>0?'worse':'better')+'">'+(x[1]>0?'&#9650;':'&#9660;')+'</span>'+esc(x[2])+'</li>';
+    const top=sorted.filter(x=>x[0]>=1.5).slice(0,8);
+    list.innerHTML=(top.length?top.map(li).join(''):'<li class="n">No change in the regime, crisis lights, recession watch, liquidity or panels.</li>')
+      +opp.map(t=>'<li class="o"><span class="arr flat">&#9679;</span>'+esc(t)+'</li>').join('');
+    if(sorted.length>top.length){more.hidden=false; all.innerHTML=sorted.map(li).join('');}
+  }
+  document.querySelectorAll('.chips button').forEach(btn=>btn.addEventListener('click',()=>{mode=btn.dataset.w; render();}));
+  fetch('history.json',{cache:'no-store'}).then(r=>r.ok?r.json():[]).then(h=>{hist=Array.isArray(h)?h:[]; if(!prevVisit) mode='1'; render();})
+    .catch(()=>{sum.textContent='Change history could not load.';});
+})();
+"""
 
 HEAD = """<!DOCTYPE html>
 <html lang="en"><head>
@@ -1230,7 +1965,8 @@ summary{list-style:none;cursor:pointer}summary::-webkit-details-marker{display:n
 .mrow summary{display:grid;grid-template-columns:5px minmax(0,1fr) 64px auto;gap:10px;align-items:center;padding:10px 0;min-height:54px}
 .bar{align-self:stretch;border-radius:3px;background:var(--c)}
 .mn{font-size:15px;font-weight:500;line-height:1.25}.mn small{display:block;font-size:12px;color:var(--mut);font-weight:400}
-.mv{display:flex;flex-direction:column;align-items:flex-end;gap:3px}
+.mv{display:flex;flex-direction:column;align-items:flex-end;gap:3px;max-width:44vw}
+.mv .arr{white-space:normal;text-align:right;line-height:1.25}
 .mv .pill{font-size:15px}
 .mrow p{margin:0 0 8px;font-size:14px}
 .spark{display:block}.spark polyline{fill:none;stroke:var(--mut);stroke-width:1.5;vector-effect:non-scaling-stroke;opacity:.8}.spark circle{fill:var(--ink)}
@@ -1250,6 +1986,62 @@ summary{list-style:none;cursor:pointer}summary::-webkit-details-marker{display:n
 .tbar{height:14px;border-radius:7px;background:var(--kar);overflow:hidden}.tbar i{display:block;height:100%;background:var(--dale);border-right:2px solid var(--bg)}
 .tugv{margin:8px 0 6px;font-size:15px}
 .fine{font-size:12px;margin:8px 0 12px}
+/* what changed */
+.chg{padding-top:16px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+.chh{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}
+.chh h2{margin:0}
+.chips{display:flex;gap:4px;background:var(--card);border-radius:999px;padding:3px;border:1px solid var(--line)}
+.chips button{font:600 13px Inter,system-ui,sans-serif;border:0;background:none;color:var(--mut);padding:8px 10px;border-radius:999px;min-height:36px;cursor:pointer}
+.chips button.on{background:var(--ink);color:var(--bg)}
+.chips button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+.cc{display:block;margin-top:2px;font-size:13px}.cc .arr{font-size:13px;margin-right:10px}
+.chl{list-style:none;padding:0;margin:0 0 8px}
+.chl li{display:grid;grid-template-columns:20px minmax(0,1fr);gap:6px;padding:7px 0;border-top:1px solid var(--line);font-size:14px;line-height:1.35}
+.chl li.n{display:block;color:var(--mut)}
+#chmore summary{font-size:14px;font-weight:600;padding:8px 0;color:var(--mut)}
+/* odds */
+.odd{background:var(--card);border-radius:14px;padding:12px;margin:0 0 10px}
+.obars,.olater,.pml{list-style:none;padding:0;margin:6px 0 0}
+.obars li{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) 44px;gap:8px;align-items:center;padding:5px 0;font-size:14px}
+.obars b{text-align:right;font-variant-numeric:tabular-nums}
+.olater li{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:6px 0;border-top:1px solid var(--line);font-size:13.5px}
+.olater span{color:var(--mut)}
+.pml li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--line)}
+.pml small{display:block;color:var(--mut);font-size:12px;line-height:1.3;margin-top:2px}
+.oy{display:flex;flex-direction:column;align-items:flex-end;gap:3px}.oy .pill{font-size:15px;min-width:52px}
+/* recession watch */
+.rwl{list-style:none;padding:0;margin:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.rwl li{display:grid;grid-template-columns:14px minmax(0,1fr);gap:8px;align-items:start;padding:10px;border-radius:12px;background:var(--card);font-size:14px;line-height:1.25}
+.rwl small{display:block;color:var(--mut);font-size:12px;margin-top:3px}
+.rl{width:12px;height:12px;border-radius:50%;border:2px solid var(--n);margin-top:2px}
+.rwl li.lit{background:var(--rbg)}.rwl li.lit .rl{background:var(--r);border-color:var(--r)}.rwl li.lit b{color:var(--r)}
+.verdict .arr{margin-left:6px}
+/* liquidity */
+.bcards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:12px}
+.bcard{background:var(--cb);border-radius:14px;padding:10px;border:1px solid color-mix(in srgb,var(--c) 25%,transparent)}
+.bh{display:flex;justify-content:space-between;align-items:baseline;gap:6px;flex-wrap:wrap;font-size:14px}.bh b{color:var(--c)}.bh span{font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums}
+.bs{display:flex;align-items:center;gap:8px;margin:4px 0 6px;flex-wrap:wrap}
+.bn{font-family:'Inter Tight',sans-serif;font-weight:800;font-size:30px;line-height:1}.bn small{font-size:14px;color:var(--mut);font-weight:600}
+.dots{display:grid;grid-template-columns:repeat(3,9px);gap:3px}.dots i{width:9px;height:9px;border-radius:50%;border:1.5px solid var(--c)}.dots i.on{background:var(--c)}
+.bcard .pill{display:block;font-size:12px;white-space:normal;line-height:1.25;padding:5px 6px;background:color-mix(in srgb,var(--c) 16%,var(--bg))}
+.blk{display:block;font-size:11.5px;line-height:1.3;margin-top:6px;color:var(--r);font-weight:600}
+.guards{list-style:none;padding:0;margin:0 0 14px}
+.guards li{display:grid;grid-template-columns:22px minmax(0,1fr);gap:6px;padding:8px 0;border-top:1px solid var(--line);font-size:14.5px}
+.guards small{display:block;color:var(--mut);font-size:12.5px}
+.gk{font-weight:800}.guards .ok .gk{color:var(--g)}.guards .bad .gk{color:var(--r)}.guards .bad b{color:var(--r)}
+.bmx{width:100%;border-collapse:collapse;font-size:14px;margin:0 0 4px}
+.bmx th,.bmx td{padding:7px 4px;border-top:1px solid var(--line);text-align:center}
+.bmx thead th{font-size:12px;color:var(--mut);font-weight:600;border-top:0}
+.bmx tbody th{text-align:left;font-weight:600;width:46%}.bmx tbody th small{display:block;font-weight:400;font-size:11.5px;color:var(--mut);line-height:1.3}
+.bmx td.y{color:var(--g);background:color-mix(in srgb,var(--g) 10%,transparent);font-weight:800}
+.bmx td.n{color:var(--r);background:color-mix(in srgb,var(--r) 7%,transparent);font-weight:800}
+.lead{background:var(--card);border-radius:14px;padding:12px;margin:0 0 6px}
+.leadc{width:100%;height:auto;display:block}
+.leadc .fut{fill:var(--ink);opacity:.06}.leadc .zero{stroke:var(--mut);stroke-width:1;opacity:.5}
+.leadc .la{fill:var(--ink);opacity:.22}.leadc .bl{fill:none;stroke:var(--dale);stroke-width:2}
+.leadc .now{stroke:var(--ink);stroke-width:1;stroke-dasharray:3 3}.leadc .ax{font-size:10px;fill:var(--mut)}
+.leg{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;margin:6px 0 0}.leg span{display:flex;align-items:center;gap:6px}
+.leg i{width:14px;height:8px;border-radius:2px}.leg .k1{background:var(--ink);opacity:.3}.leg .k2{background:var(--dale);height:3px}
 /* layoffs chart */
 .djc{background:var(--card);border-radius:14px;padding:12px;margin:0 0 6px}
 .djh{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;font-size:15px}
