@@ -551,7 +551,7 @@ GAUGES = [
     ("Conditions", "NFCI risk component", "NFCIRISK", g_level("NFCIRISK"), "", "up", -0.2, 0.0, "Risk part of the Chicago Fed index: volatility and funding risk. Above 0 = tighter than average."),
     ("Conditions", "NFCI credit component", "NFCICREDIT", g_level("NFCICREDIT"), "", "up", -0.2, 0.0, "Credit part of the Chicago Fed index. Above 0 = tighter than average."),
     ("Conditions", "NFCI leverage component", "NFCILEVERAGE", g_level("NFCILEVERAGE"), "", "up", -0.1, 0.25, "Leverage part of the Chicago Fed index. Rising = leverage building."),
-    ("Conditions", "VIX", "VIXCLS", g_level("VIXCLS"), "", "up", 20, 27, "Fear gauge for stocks."),
+    ("Conditions", "VIX", "VIXCLS", g_level("VIXCLS"), "", "up", 20, 27, "Fear gauge for stocks. Under 20 calm, 20-27 nervous, 27+ stressed, 40+ panic (panic is usually near the bottom, not the start)."),
     ("Conditions", "VIX curve (1-mo vs 3-mo)", "X:VIXT", g_level("X:VIXT"), "x", "up", 0.95, 1.0, "Above 1.0 = inverted: traders paying up for protection right now. Often leads selloffs."),
     ("Conditions", "Market breadth, 3-mo", "X:BREADTH", g_change("X:BREADTH", 90), "pct", "down", -0.03, -0.06, "Equal-weight vs cap-weight S&P (RSP vs SPY). Falling = fewer stocks carrying the index."),
     ("Dollar & oil", "Broad dollar, 3-mo change", "DTWEXBGS", g_change("DTWEXBGS", 90), "pct", "up", 0.02, 0.04, "A fast-rising dollar squeezes global dollar borrowers."),
@@ -1281,6 +1281,7 @@ def build():
         "name": "System Health", "short_name": "Sys Health", "start_url": "./", "display": "standalone",
         "background_color": "#0f1a14", "theme_color": "#0f1a14", "icons": [{"src": "icon.png", "sizes": "180x180", "type": "image/png"}]}))
     write_icon(os.path.join(OUT, "icon.png"))
+    for tn in ("green", "yellow", "red", "grey"): write_favicon(os.path.join(OUT, f"favicon-{tn}.png"), tn)
     slim = {"updated": NOW.isoformat(), "regime": regime, "regime_month_ago": calc_prev, "liquidity": lstate,
             "recession_watch": [[n_, bool(l_), r_] for n_, l_, r_ in rwatch],
             "bottoms": [{k: v for k, v in b_.items() if k != "checks"} | {"checks": [[c[0], bool(c[1])] for c in b_["checks"]]} for b_ in bottoms],
@@ -1464,6 +1465,258 @@ def arrow(delta_text, worse):
 def chg_class(v):
     return "pos" if num(v) and v > 0 else "neg" if num(v) and v < 0 else ""
 
+# =========================================================================== bottom line: plain-English briefing
+# Turns everything below into: a one-line verdict, what to do, the 3 things that matter most,
+# what's closest to turning red, what's still holding up, and the slow-burn backdrop.
+# Gauge name or "light:key" -> (theme, speed, red headline, yellow headline, why it matters, short label)
+PLAIN = {
+    "light:dollar": ("dollar", "fast", "The dollar is surging", "The dollar is climbing",
+        "A fast-rising dollar squeezes everyone who borrowed in dollars, worldwide. It helped trigger 1998, 2008 and 2022.", "Dollar"),
+    "light:us10": ("rates", "fast", "Long-term rates are near the danger zone", "Long-term rates are elevated",
+        "The 10-year sets mortgage and loan rates. A jump toward 5.5%, or a fast spike, is where things tend to break.", "10-yr yield"),
+    "light:japan": ("japan", "fast", "Japan's cheap-money trade is unwinding", "Japan's cheap-money trade is wobbling",
+        "Investors borrowed cheap yen to buy assets worldwide. A yen surge forces fast selling, as in August 2024.", "Yen carry"),
+    "light:credit": ("credit", "fast", "Credit markets are cracking", "Credit markets are showing strain",
+        "When companies can't borrow cheaply, layoffs and defaults follow. Credit is the most reliable crash tell.", "Credit"),
+    "light:funding": ("funding", "fast", "Banks are short of cash", "Bank funding is a little tight",
+        "Stress in overnight bank lending is how 2008 and the 2019 repo spike started.", "Bank funding"),
+    "light:fed": ("fed", "fast", "The Fed is tightening into weakness", "The Fed risks tightening too much",
+        "Raising rates while the economy weakens is the classic mistake that turns a slowdown into a recession.", "Fed"),
+    "10-yr Treasury yield": ("rates", "fast", "Long-term rates are spiking", "Long-term rates are elevated",
+        "The 10-year sets mortgage and loan rates and weighs on stock prices.", "10-yr Treasury yield"),
+    "30-yr Treasury yield": ("rates", "fast", "Buyers want more to hold long-term US debt", "Long-term US debt is under pressure",
+        "A 30-year above 5% signals worry about deficits and keeps mortgage rates high.", "30-yr Treasury yield"),
+    "10-yr real yield (TIPS)": ("rates", "fast", "Money is very tight after inflation", "Money is getting tight after inflation",
+        "High real rates squeeze borrowers and stock valuations.", "Real yield"),
+    "10-yr minus 3-mo curve": ("curve", "fast", "The yield curve is inverted", "The yield curve is flattening",
+        "An inverted curve has come before most recessions, usually 6 to 18 months ahead.", "Yield curve (10y-3m)"),
+    "2-yr to 10-yr curve": ("curve", "fast", "The yield curve is inverted", "The yield curve is flattening",
+        "An inverted curve has come before most recessions.", "Yield curve (2s10s)"),
+    "Bull re-steepening": ("curve", "fast", "The curve is re-steepening the recession way", "The curve may be re-steepening the recession way",
+        "Short rates falling fast while the curve steepens has often marked the start of a recession.", "Bull re-steepening"),
+    "SOFR minus IORB": ("funding", "fast", "Banks are short of cash", "Bank funding is a little tight",
+        "Stress in overnight bank lending is how 2008 and the 2019 repo spike started.", "Overnight bank funding"),
+    "Commercial paper spread": ("funding", "fast", "Short-term lenders are hoarding cash", "Short-term lending is tightening",
+        "Companies use commercial paper to make payroll. It froze in 2008 and 2020.", "Commercial paper"),
+    "High-yield bond spread": ("credit", "fast", "Junk bonds are selling off", "Junk bonds are wobbling",
+        "When risky companies can't borrow cheaply, layoffs and defaults follow. The most reliable crash tell.", "Junk-bond spread"),
+    "Investment-grade spread": ("credit", "fast", "Even blue-chip debt is under stress", "Blue-chip debt is wobbling",
+        "Stress reaching the strongest companies means it is spreading.", "Blue-chip bond spread"),
+    "CCC junk spread": ("credit", "fast", "The weakest companies are struggling to borrow", "The weakest companies are under strain",
+        "Cracks show first in the lowest-rated debt. If it spreads to junk bonds overall, that is a crisis signal.", "CCC (weakest) bonds"),
+    "CCC vs high-yield ratio": ("credit", "fast", "Stress is piling up at the weakest borrowers", "Stress is building at the weakest borrowers",
+        "Cracks show first in the lowest-rated debt. If it spreads to junk bonds overall, that is a crisis signal.", "CCC vs junk ratio"),
+    "Excess bond premium": ("credit", "fast", "Bond investors are scared", "Bond investors are getting nervous",
+        "Fear beyond what defaults justify. One of the best recession predictors.", "Bond fear premium"),
+    "Banks tightening business loans": ("lending", "fast", "Banks are cutting off business credit", "Banks are pulling back on business loans",
+        "When banks tighten, hiring and spending slow a few quarters later.", "Bank business lending"),
+    "Banks tightening credit cards": ("lending", "fast", "Banks are cutting consumer credit", "Banks are tightening on credit cards",
+        "Less credit for households means less spending ahead.", "Bank credit-card lending"),
+    "Banks tightening CRE loans": ("lending", "fast", "Banks are cutting property loans", "Banks are tightening on property loans",
+        "Commercial property lives on refinancing. Tight credit there hits regional banks.", "Bank property lending"),
+    "Banks tightening auto loans": ("lending", "fast", "Banks are cutting car loans", "Banks are tightening on car loans",
+        "Less credit for households means less spending ahead.", "Bank auto lending"),
+    "Chicago Fed financial conditions": ("conditions", "fast", "Financial conditions are tight", "Financial conditions are tightening",
+        "Sums up how easy it is to borrow, lend and raise money across the system.", "Financial conditions"),
+    "St. Louis Fed stress index": ("conditions", "fast", "System-wide financial stress is high", "Financial stress is above normal",
+        "A broad read of stress across rates, spreads and volatility.", "Financial stress index"),
+    "NFCI risk component": ("conditions", "fast", "Funding and volatility risk is high", "Funding and volatility risk is rising",
+        "The risk slice of the Chicago Fed index.", "Chicago Fed risk"),
+    "NFCI credit component": ("conditions", "fast", "Credit conditions are tight", "Credit conditions are tightening",
+        "The credit slice of the Chicago Fed index. Above 0 means tighter than normal.", "Chicago Fed credit conditions"),
+    "NFCI leverage component": ("leverage", "slow", "Leverage is building", "Leverage is creeping up",
+        "Borrowed money piling up makes the next drop worse.", "Leverage"),
+    "VIX": ("fear", "fast", "Stock traders are scared", "Stock traders are getting nervous",
+        "Under 20 is calm, 27+ is stress, 40+ is panic. Panic is usually where bottoms form, not where trouble starts.", "VIX (stock fear gauge)"),
+    "VIX curve (1-mo vs 3-mo)": ("fear", "fast", "Traders are paying up for crash protection now", "Traders are buying near-term protection",
+        "Short-term fear above longer-term fear often comes with, or just before, a selloff.", "VIX curve"),
+    "Market breadth, 3-mo": ("fear", "fast", "A few giant stocks are carrying the market", "Fewer stocks are carrying the market",
+        "Narrow rallies are fragile. When the leaders slip there is nothing underneath.", "Market breadth"),
+    "Broad dollar, 3-mo change": ("dollar", "fast", "The dollar is surging", "The dollar is climbing",
+        "A fast-rising dollar squeezes everyone who borrowed in dollars, worldwide.", "Dollar, 3-mo move"),
+    "Brent crude": ("energy", "fast", "Oil is expensive", "Oil is elevated",
+        "Pricey oil feeds inflation and keeps the Fed from cutting.", "Oil"),
+    "OECD leading indicator": ("growth", "fast", "The economy's leading signals are falling", "The economy is slowing",
+        "Leading indicators turn before the economy does.", "Leading indicator"),
+    "Philly Fed new orders": ("growth", "fast", "Factory orders are shrinking", "Factory orders are soft",
+        "New orders are the earliest read on business activity.", "Philly factory orders"),
+    "NY Fed new orders": ("growth", "fast", "Factory orders are shrinking", "Factory orders are soft",
+        "New orders are the earliest read on business activity.", "NY factory orders"),
+    "Building permits, 1 yr": ("growth", "fast", "Housing is rolling over", "Housing is slowing",
+        "Housing usually turns before the rest of the economy.", "Building permits"),
+    "Sahm rule": ("labor", "fast", "Unemployment is rising like a recession", "Unemployment is creeping up",
+        "0.5 or higher has marked every recession since 1970.", "Sahm rule"),
+    "Initial jobless claims": ("labor", "fast", "Layoffs are rising", "Layoffs are ticking up",
+        "Weekly layoffs are the fastest read on the job market.", "Jobless claims"),
+    "Continuing claims": ("labor", "fast", "Laid-off workers can't find new jobs", "Finding a new job is getting harder",
+        "Rising continuing claims mean hiring has slowed.", "Continuing claims"),
+    "U-6 underemployment": ("labor", "fast", "Underemployment is high", "Underemployment is rising",
+        "The broadest measure of slack in the job market.", "Underemployment"),
+    "Personal savings rate": ("households", "fast", "Households are out of cushion", "Households' cushion is thin",
+        "With little saved, a job loss turns straight into missed payments.", "Savings rate"),
+    "Credit card delinquency": ("households", "fast", "Households are falling behind on cards", "Card payments are slipping",
+        "Late payments are the first sign of household strain.", "Card delinquencies"),
+    "CPI, 6-mo annualized": ("inflation", "fast", "Inflation is running hot", "Inflation is sticky",
+        "Hot inflation stops the Fed from coming to the rescue.", "Inflation (CPI)"),
+    "10-yr breakeven inflation": ("inflation", "fast", "Bonds expect high inflation", "Inflation expectations are rising",
+        "If investors expect inflation, they demand higher rates.", "Inflation expectations"),
+    "Federal interest / receipts": ("fiscal", "slow", "", "", "", "interest eats {v} of tax revenue"),
+    "Federal deficit, % of GDP": ("fiscal", "slow", "", "", "", "deficit {v} of GDP"),
+    "Federal debt, % of GDP": ("fiscal", "slow", "", "", "", "federal debt {v} of GDP"),
+}
+THEME_ORDER = ["dollar", "credit", "funding", "fear", "rates", "japan", "fed", "labor", "lending", "conditions",
+               "curve", "growth", "households", "inflation", "energy", "leverage", "fiscal"]
+
+def briefing(d):
+    reg = d["regime"]; core = d["core"]; gauges = d["gauges"]
+    nrw = sum(1 for x in d["rwatch"] if x[1]); nrwp = sum(1 for x in d["rwatch_prev"] if x[1])
+    pts = lambda s: 2 if s == R else 1 if s == Y else 0
+    p_now, p_then = sum(pts(l["st"]) for l in core), sum(pts(l["prev"]) for l in core)
+    score_now, score_then = p_now + nrw, p_then + nrwp
+
+    # ---- verdict
+    if d["capitulation"]: head = "Panic selling is here. Historically the best time to start buying, in stages."
+    elif reg == "RED" and nrw >= 4: head = "Danger. Financial stress is high and recession signals are clustering."
+    elif reg == "RED": head = "Danger. Markets are under real stress, though the economy hasn't cracked yet."
+    elif reg == "YELLOW" and nrw >= 4: head = "Caution, leaning danger. Markets are stressed and recession signals are piling up."
+    elif reg == "YELLOW" and nrw >= 2: head = "Caution. Markets are stressed and the economy is starting to slow."
+    elif reg == "YELLOW": head = "Caution. Stress is building in markets, but the economy is still holding up."
+    elif reg == "GREEN" and nrw >= 2: head = "Mostly healthy, but early recession warnings are flickering."
+    elif reg == "GREEN": head = "All clear. Markets and the economy look healthy."
+    else: head = "Not enough data yet to judge."
+    trend = ("worse", "&#9650; Worse than a month ago") if score_now > score_then else \
+            ("better", "&#9660; Better than a month ago") if score_now < score_then else ("flat", "About the same as a month ago")
+
+    # ---- what to do
+    todo = []
+    if d["capitulation"]: todo.append(("Stocks", "Start buying in thirds, quality first. Keep the rest for lower prices."))
+    elif reg == "GREEN": todo.append(("Stocks", "Stay invested. Buy dips in names that are in uptrends, at full planned size."))
+    elif reg == "YELLOW": todo.append(("Stocks", "Hold what you own. Put new money in slowly: 1/3 size, in stages, only where your watchlist says so."))
+    elif reg == "RED": todo.append(("Stocks", "Protect capital. No new stock buys until “Blood in the streets” turns on."))
+    bs = d["bottoms"]
+    if bs:
+        conf = [b["name"] for b in bs if b["st"] == G]
+        part = [b["name"] for b in bs if b["st"] == Y]
+        if conf: txt = f"Bottom confirmed in {join_names(conf)}. Buy in size."
+        elif part: txt = f"{join_names(part)} {'is' if len(part) == 1 else 'are'} bottoming. A 1/3 starter position at most."
+        else:
+            best = max(bs, key=lambda b: b["n"])
+            txt = f"No bottom yet (closest: {best['name']}, {best['n']} of 6 checks). Hold what you have; don't buy in size."
+        if d["lstate"] == "Falling" and not conf: txt += " Liquidity is falling, which tends to weigh on them."
+        todo.append(("Gold, silver, Bitcoin", txt))
+    if d["capitulation"]: todo.append(("Cash", "Start putting dry powder to work, in stages."))
+    elif reg in ("YELLOW", "RED"): todo.append(("Cash", "Keep dry powder in T-bills or a money market fund for when the panic comes."))
+    else: todo.append(("Cash", "Normal cash reserve is fine."))
+
+    # ---- candidates: every caution flag, scored
+    fo = (d.get("fedodds") or [None])[0]
+    cands = []
+    for l in core:
+        if l["st"] not in (R, Y): continue
+        th, sp, rt, yt, why, lab = PLAIN["light:" + l["key"]]
+        worse = pts(l["st"]) > pts(l["prev"])
+        if l["key"] == "fed" and fo:
+            ph = fo["odds"].get("hike25", 0) + fo["odds"].get("hike_big", 0)
+            if ph >= 0.5: why += f" Markets see a {ph:.0%} chance of a hike on {fo['label']}."
+        cands.append(dict(theme=th, score=(100 if l["st"] == R else 45) + (15 if worse else 0), st=l["st"],
+                          title=rt if l["st"] == R else yt, val=f'{l["value"]} \xb7 {l["detail"]}', why=why,
+                          href=f'#light-{l["key"]}', short=f'{lab} {l["value"]}'))
+    trips, slow = [], []
+    for g in gauges:
+        info = PLAIN.get(g["name"])
+        if not info: continue
+        th, sp, rt, yt, why, lab = info
+        vt = g.get("vtext") or fmt(g["v"], g["unit"])
+        if sp == "slow":
+            if g["st"] == R: slow.append(lab.format(v=vt) if "{v}" in lab else f"{lab} {vt}")
+            continue
+        if g["st"] not in (R, Y): continue
+        prox = None
+        if num(g.get("y"), g.get("r"), g.get("v")) and g["r"] != g["y"]:
+            prox = max(0.0, min(1.0, (g["v"] - g["y"]) / (g["r"] - g["y"])))
+        sc = (70 if g["st"] == R else 30) + (15 if g["worse"] else 0) + (20 * prox if g["st"] == Y and prox else 0)
+        cands.append(dict(theme=th, score=sc, st=g["st"], title=rt if g["st"] == R else yt,
+                          val=vt + (f' \xb7 red at {fmt(g["r"], g["unit"])}' if g["st"] == Y and num(g.get("r")) else ""),
+                          why=why, href=f'#g-{slug(g["name"])}', short=f"{lab} {vt}"))
+        if g["st"] == Y and prox is not None and prox >= 0.6:
+            du = "pts" if g["unit"] in ("%", "net %", "pts") else g["unit"]
+            mv = (fmt(g["d"], du, True) + (" pts" if du == "pts" else "") + " in 1 mo") if num(g["d"]) else ""
+            still = not num(g["d"]) or abs(g["d"]) < 0.02 * abs(g["r"] - g["y"])
+            trips.append(dict(lab=lab, now=vt, red=fmt(g["r"], g["unit"]), p=prox, worse=None if still else g["worse"], mv="" if still else mv, href=f'#g-{slug(g["name"])}'))
+    if nrw >= 2:
+        cands.append(dict(theme="growth", score=60 + 15 * (nrw >= 4) + (15 if nrw > nrwp else 0), st=R if nrw >= 4 else Y,
+                          title="Recession signals are clustering" if nrw >= 4 else "Some recession warnings are lit",
+                          val=f"{nrw} of 8 lit ({nrwp} a month ago)", why="One signal means little. Several at once has preceded past recessions.",
+                          href="#recession", short=f"{nrw} of 8 recession signals"))
+    if d["lstate"] in ("Falling", "Rolling over"):
+        cands.append(dict(theme="liquidity", score=40 if d["lstate"] == "Falling" else 25, st=R if d["lstate"] == "Falling" else Y,
+                          title="Global liquidity is draining" if d["lstate"] == "Falling" else "Global liquidity is rolling over",
+                          val="Liquidity: " + d["lstate"], why="Michael Howell's work: liquidity leads Bitcoin by about 3 months, and gold and silver too.",
+                          href="#liq", short="Liquidity " + d["lstate"].lower()))
+    order = {t: i for i, t in enumerate(THEME_ORDER + ["liquidity"])}
+    cands.sort(key=lambda c: (-c["score"], order.get(c["theme"], 99)))
+    top, seen = [], {}
+    for c in cands:
+        if c["theme"] in seen:
+            w = seen[c["theme"]]
+            if len(w.setdefault("also", [])) < 2 and c["short"] not in w["also"]: w["also"].append(c["short"])
+            continue
+        if len(top) < 3:
+            seen[c["theme"]] = c; top.append(c)
+    n_other = len({c["theme"] for c in cands}) - len(top)
+    trips.sort(key=lambda x: -x["p"])
+
+    # ---- still holding up
+    gi = {g["name"]: g for g in gauges}; li = {l["key"]: l for l in core}
+    ok = []
+    def gok(name, title):
+        g = gi.get(name)
+        if g and g["st"] == G: ok.append((title, g.get("vtext") or fmt(g["v"], g["unit"]), f'#g-{slug(name)}'))
+    if nrw == 0: ok.append(("No recession signals lit", "0 of 8", "#recession"))
+    elif nrw == 1: ok.append(("Only 1 of 8 recession signals lit", "1 of 8", "#recession"))
+    gok("Initial jobless claims", "Layoffs are still low")
+    gok("High-yield bond spread", "The broad junk-bond market is calm")
+    gok("Chicago Fed financial conditions", "Overall borrowing conditions are still easy")
+    if li.get("japan", {}).get("st") == G: ok.append(("No yen-carry unwind", li["japan"]["value"], "#light-japan"))
+    if li.get("funding", {}).get("st") == G: ok.append(("Banks have plenty of cash", li["funding"]["value"], "#light-funding"))
+    gok("CPI, 6-mo annualized", "Inflation is under control")
+    if d["lstate"] == "Rising": ok.append(("Global liquidity is rising", "Rising", "#liq"))
+    return dict(head=head, trend=trend, todo=todo, top=top, n_other=n_other, trips=trips[:4], ok=ok[:3], slow=slow)
+
+def join_names(xs):
+    return xs[0] if len(xs) == 1 else ", ".join(xs[:-1]) + " and " + xs[-1]
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+def briefing_html(b, tone):
+    E = html.escape
+    todo = "".join(f'<li><b>{E(k)}</b><span>{E(v)}</span></li>' for k, v in b["todo"])
+    top = "".join(f'''<li class="s-{TONE[c["st"]]}"><a href="{c["href"]}"><span class="bn">{i}</span><div>
+<b>{E(c["title"])}</b><span class="bv">{E(c["val"])}</span><p>{E(c["why"])}</p>{f'<small>Also: {E(" · ".join(c["also"]))}</small>' if c.get("also") else ""}</div></a></li>'''
+                  for i, c in enumerate(b["top"], 1))
+    if not top: top = '<li class="s-green"><div><b>Nothing is flashing.</b><p>No crisis light or fast-moving gauge is in caution or stress.</p></div></li>'
+    more = f'<p class="fine muted">{b["n_other"]} more caution area{"s" if b["n_other"] != 1 else ""} below. Tap any item to jump to it.</p>' if b["n_other"] > 0 else '<p class="fine muted">Tap any item to jump to it.</p>'
+    trips = "".join(f'''<li><a href="{t["href"]}"><div class="tt"><b>{E(t["lab"])}</b><span>{E(t["now"])} now &middot; red at {E(t["red"])}</span></div>
+<div class="trb"><i style="width:{t["p"]*100:.0f}%"></i></div>
+<small class="{"worse" if t["worse"] else "better" if t["worse"] is False else "flat"}">{"&#9650; Heading toward red" if t["worse"] else "&#9660; Easing" if t["worse"] is False else "No change in a month"}{f" ({E(t['mv'])})" if t["mv"] else ""} &middot; {t["p"]*100:.0f}% of the way from caution to red</small></a></li>''' for t in b["trips"])
+    ok = "".join(f'<li><a href="{h}"><b>{E(t)}</b><span>{E(v)}</span></a></li>' for t, v, h in b["ok"])
+    slow = (f'<p class="slowb"><b>Slow-burn backdrop</b> (years, not weeks): {E("; ".join(b["slow"]))}. These explain why the long-run picture is fragile, '
+            'but they don\'t time a crash, so expect them to stay red. Judge timing by the items above.</p>') if b["slow"] else ""
+    return f'''<section class="wrap bl" id="bottomline"><h2>Bottom line</h2>
+<div class="blh s-{tone}"><b>{E(b["head"])}</b><span class="arr {b["trend"][0]}">{b["trend"][1]}</span></div>
+<h3>What to do now</h3><ul class="todo">{todo}</ul>
+<h3>What matters most right now</h3><ol class="top3">{top}</ol>{more}
+{f'<h3>Closest to turning red</h3><ul class="trip">{trips}</ul>' if trips else ""}
+{f'<h3>Still holding up</h3><ul class="okl">{ok}</ul>' if ok else ""}
+{slow}
+<details class="howto"><summary>How to read this page in 30 seconds</summary><ol>
+<li><b>Banner color</b> is the overall call: green healthy, yellow caution, red stress. It comes from the six crisis lights only.</li>
+<li><b>Bottom line</b> (this box) tells you what matters and what to do. Most days you can stop here.</li>
+<li><b>What changed</b> tells you if things are getting better or worse since your last visit.</li>
+<li>Only dig into a section when something here points you to it. A red gauge on its own is not an alarm; red lights clustering and getting worse is.</li></ol></details>
+</section>'''
+
 def render(d):
     reg = d["regime"]; tone = TONE[reg]
     guide = {"GREEN": "Healthy. Buy dips in uptrends.", "YELLOW": "Stress building. Small, staged buys only.",
@@ -1555,10 +1808,10 @@ def render(d):
                    G: "No sign of a policy error", N: "No data"}[fl["st"]]
 
     # ---------------- generic metric row (gauges and main street)
-    def mrow(name, value, st, delta_txt, worse, sp, asof, meaning, rule):
+    def mrow(name, value, st, delta_txt, worse, sp, asof, meaning, rule, gid=""):
         t = TONE[st]
         asof_s = asof.strftime("%b %-d, %Y") if isinstance(asof, dt.date) else "n/a"
-        return f'''<details class="mrow"><summary><span class="bar s-{t}"></span>
+        return f'''<details class="mrow"{f' id="{gid}"' if gid else ""}><summary><span class="bar s-{t}"></span>
 <span class="mn">{E(name)}<small>as of {asof_s}</small></span>{spark(sp, cls="g")}
 <span class="mv"><b class="pill s-{t}">{E(value)}</b>{arrow(delta_txt, worse)}</span></summary>
 <p>{E(meaning)}</p><p class="muted">{E(rule)}.</p></details>'''
@@ -1574,7 +1827,7 @@ def render(d):
         du = "pts" if g["unit"] in ("%", "net %", "pts") else g["unit"]
         dtxt = (fmt(g["d"], du, True) + (" pts" if du == "pts" else "") + " in 1 mo") if num(g["d"]) else ""
         rule = g.get("rule") or f'Yellow at {fmt(g["y"], g["unit"])}, red at {fmt(g["r"], g["unit"])} ({"higher" if g["direction"]=="up" else "lower"} is worse). Source: {g["sid"].replace("X:", "derived ")}'
-        gauge_html.append(mrow(g["name"], g.get("vtext") or fmt(g["v"], g["unit"]), g["st"], dtxt, g["worse"], g["spark"], g["asof"], g["meaning"], rule))
+        gauge_html.append(mrow(g["name"], g.get("vtext") or fmt(g["v"], g["unit"]), g["st"], dtxt, g["worse"], g["spark"], g["asof"], g["meaning"], rule, "g-" + slug(g["name"])))
 
     # ---------------- jobs and layoffs
     jb = d["jb"]
@@ -1739,6 +1992,7 @@ def render(d):
 </div>{cap_note}{ov_note}
 <div class="stale" id="stale">Data is more than 3 hours old. The hourly update may have paused.</div>
 </div></header>
+{briefing_html(briefing(d), tone)}
 <section class="wrap chg" id="changes"><div class="chh"><h2>What changed</h2>
 <div class="chips" role="tablist"><button data-w="last" class="on">Since last visit</button><button data-w="1">1 day</button><button data-w="7">1 week</button><button data-w="30">1 month</button></div></div>
 <div id="chsum" class="verdict s-grey">Loading change history&hellip;</div><ul id="chlist" class="chl"></ul>
@@ -1800,8 +2054,13 @@ def render(d):
 <script>%%CHANGES_JS%%</script>
 <script>{{const el=document.getElementById('upd');const t=new Date(el.dataset.t);const m=Math.round((Date.now()-t)/60000);
 el.textContent='Updated '+(m<1?'just now':m<60?m+' min ago':m<1440?Math.round(m/60)+' hr ago':Math.round(m/1440)+' days ago');
-if(m>180)document.getElementById('stale').style.display='block';}}</script>'''
-    return HEAD + body.replace("%%CHANGES_JS%%", CHANGES_JS) + "\n</body></html>"
+if(m>180)document.getElementById('stale').style.display='block';}}
+function openT(id){{const el=document.getElementById(id);if(el&&el.tagName==='DETAILS')el.open=true;}}
+document.addEventListener('click',e=>{{const a=e.target.closest('a[href^="#"]');if(a)openT(a.getAttribute('href').slice(1));}});
+if(location.hash)openT(location.hash.slice(1));</script>'''
+    dot = {"GREEN": "\U0001F7E2", "YELLOW": "\U0001F7E1", "RED": "\U0001F534"}.get(reg, "\u26AA")
+    head = HEAD.replace("%%TITLE%%", f"{dot} {reg} \xb7 System Health").replace("%%FAVICON%%", f"favicon-{tone}.png")
+    return head + body.replace("%%CHANGES_JS%%", CHANGES_JS) + "\n</body></html>"
 
 
 CHANGES_JS = r"""
@@ -1882,8 +2141,8 @@ HEAD = """<!DOCTYPE html>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Sys Health">
 <meta name="theme-color" content="#0f1a14">
-<link rel="apple-touch-icon" href="icon.png"><link rel="manifest" href="manifest.webmanifest">
-<title>System Health</title>
+<link rel="icon" type="image/png" sizes="64x64" href="%%FAVICON%%"><link rel="apple-touch-icon" href="icon.png"><link rel="manifest" href="manifest.webmanifest">
+<title>%%TITLE%%</title>
 <style>
 /* VOICE: a control-room annunciator: calm until something lights up.
    IDEA: one master light (regime), six crisis lamps beneath it, then the instruments.
@@ -1987,6 +2246,38 @@ summary{list-style:none;cursor:pointer}summary::-webkit-details-marker{display:n
 .tugv{margin:8px 0 6px;font-size:15px}
 .fine{font-size:12px;margin:8px 0 12px}
 /* what changed */
+/* bottom line briefing */
+.bl{padding-top:18px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.bl h2{font-size:22px;margin-bottom:8px}
+.blh{border-radius:12px;padding:12px 14px;background:var(--cb);border-left:5px solid var(--c)}
+.blh b{display:block;font-size:17px;line-height:1.3;color:var(--ink);text-wrap:pretty}
+.blh .arr{display:block;margin-top:4px;font-size:13px}
+.todo,.top3,.trip,.okl{list-style:none;padding:0;margin:0}
+.todo li{display:grid;grid-template-columns:104px minmax(0,1fr);gap:10px;padding:8px 0;border-top:1px solid var(--line);font-size:14.5px;line-height:1.35}
+.todo li:first-child{border-top:0}.todo b{font-size:13px;color:var(--mut);font-weight:600}
+.top3{display:grid;gap:8px}
+.top3 li{border-radius:12px;background:var(--card);border-left:5px solid var(--c)}
+.top3 a,.top3 li>div{display:grid;grid-template-columns:26px minmax(0,1fr);gap:8px;padding:11px 12px;color:inherit;text-decoration:none}
+.top3 .bn{width:24px;height:24px;border-radius:50%;background:var(--c);color:#fff;font-weight:800;font-size:13px;display:flex;align-items:center;justify-content:center}
+.top3 b{display:block;font-size:15.5px;line-height:1.3}
+.top3 .bv{display:inline-block;margin:4px 0 2px;padding:2px 8px;border-radius:7px;background:var(--cb);color:var(--c);font-weight:700;font-size:13px;font-variant-numeric:tabular-nums}
+.top3 p{margin:2px 0 0;font-size:13.5px;line-height:1.4;color:var(--mut)}
+.top3 small{display:block;margin-top:4px;font-size:12.5px;color:var(--mut)}
+.fine{font-size:12.5px;margin:6px 0 0}
+.trip li a{display:block;padding:9px 0;border-top:1px solid var(--line);color:inherit;text-decoration:none}
+.trip li:first-child a{border-top:0}
+.trip .tt{display:flex;justify-content:space-between;gap:10px;align-items:baseline;font-size:14.5px}
+.trip .tt span{font-size:13px;color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums}
+.trb{height:8px;border-radius:5px;margin:6px 0 4px;background:linear-gradient(90deg,var(--ybg),var(--rbg));overflow:hidden}
+.trb i{display:block;height:100%;border-radius:5px;background:linear-gradient(90deg,var(--y),var(--r))}
+.trip small{font-size:12px;font-weight:600}.trip small.worse{color:var(--r)}.trip small.better{color:var(--g)}.trip small.flat{color:var(--mut)}
+.okl{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+.okl a{display:block;height:100%;padding:9px 11px;border-radius:10px;background:var(--gbg);color:inherit;text-decoration:none;font-size:13.5px;line-height:1.3}
+.okl b{display:block;color:var(--g);font-weight:600}.okl span{font-size:12.5px;color:var(--mut);font-variant-numeric:tabular-nums}
+.slowb{font-size:13px;line-height:1.45;color:var(--mut);background:var(--card);border-radius:10px;padding:10px 12px;margin:12px 0 0}
+.slowb b{color:var(--ink)}
+.howto{margin-top:10px;font-size:13.5px}.howto summary{cursor:pointer;font-weight:600;color:var(--mut)}
+.howto ol{margin:6px 0 0;padding-left:20px;line-height:1.45}.howto li{margin:4px 0}
 .chg{padding-top:16px;padding-bottom:6px;border-bottom:1px solid var(--line)}
 .chh{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}
 .chh h2{margin:0}
@@ -2096,6 +2387,28 @@ def write_icon(path):
             raw += bytes(px)
     def chunk(t, b): return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b) & 0xffffffff)
     png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
+    open(path, "wb").write(png)
+
+
+FAV_COLORS = {"green": ((34, 197, 94), (12, 92, 46)), "yellow": ((250, 190, 40), (138, 90, 0)),
+              "red": ((239, 68, 58), (140, 28, 20)), "grey": ((156, 163, 175), (75, 85, 99))}
+
+def write_favicon(path, tone):
+    """64x64 PNG tab icon: one status lamp in the regime color, transparent corners. Stdlib only."""
+    W = H = 64; fill, rim = FAV_COLORS[tone]; cx = cy = 31.5; R0, R1 = 30.0, 25.5
+    raw = bytearray()
+    for y in range(H):
+        raw.append(0)
+        for x in range(W):
+            dd = math.hypot(x - cx, y - cy)
+            a = max(0.0, min(1.0, R0 + 0.5 - dd))          # anti-aliased outer edge
+            k = max(0.0, min(1.0, R1 + 0.5 - dd))          # inner fill vs rim
+            c = tuple(int(f * k + r * (1 - k)) for f, r in zip(fill, rim))
+            hl = max(0.0, 1 - math.hypot(x - 24, y - 22) / 13) * 0.45 * k   # small highlight
+            c = tuple(int(v + (255 - v) * hl) for v in c)
+            raw += bytes(c + (int(255 * a),))
+    def chunk(t, b): return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b) & 0xffffffff)
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
     open(path, "wb").write(png)
 
 
